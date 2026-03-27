@@ -526,7 +526,7 @@ enum TranscribeCommand {
             try await Task.sleep(nanoseconds: 500_000_000)  // 0.5 seconds
 
             // Finalize transcription
-            let finalText = try await streamingAsr.finish()
+            let (finalText, _) = try await streamingAsr.finish()
 
             // Cancel update task
             updateTask.cancel()

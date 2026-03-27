@@ -229,7 +229,7 @@ struct ParakeetEouCommand {
 
             let startTime = Date()
             var transcript = try await manager.process(audioBuffer: buffer)
-            transcript += try await manager.finish()
+            transcript += try await manager.finish().text
             let duration = Date().timeIntervalSince(startTime)
 
             logger.info("--- Transcript ---")
@@ -345,7 +345,7 @@ struct ParakeetEouCommand {
 
                 let startTime = Date()
                 var transcript = try await manager.process(audioBuffer: buffer)
-                transcript += try await manager.finish()
+                transcript += try await manager.finish().text
                 let duration = Date().timeIntervalSince(startTime)
 
                 // Normalize for WER calculation

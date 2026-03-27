@@ -220,7 +220,7 @@ public class NemotronBenchmark {
         // Process
         let startTime = Date()
         _ = try await manager.process(audioBuffer: buffer)
-        let hypothesis = try await manager.finish()
+        let (hypothesis, _) = try await manager.finish()
         let processingTime = Date().timeIntervalSince(startTime)
 
         // Calculate WER

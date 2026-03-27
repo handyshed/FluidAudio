@@ -27,6 +27,7 @@ public actor StreamingAsrManager {
     private var segmentIndex: Int = 0
     private var lastProcessedFrame: Int = 0
     private var accumulatedTokens: [Int] = []
+    private var accumulatedConfidences: [Float] = []
 
     // Raw sample buffer for sliding-window assembly (absolute indexing)
     private var sampleBuffer: [Float] = []
@@ -94,6 +95,7 @@ public actor StreamingAsrManager {
         segmentIndex = 0
         lastProcessedFrame = 0
         accumulatedTokens.removeAll()
+        accumulatedConfidences.removeAll()
 
         startTime = Date()
 
@@ -147,8 +149,8 @@ public actor StreamingAsrManager {
     }
 
     /// Finish streaming and get the final transcription
-    /// - Returns: The complete transcription text
-    public func finish() async throws -> String {
+    /// - Returns: The complete transcription text and per-token confidences
+    public func finish() async throws -> (text: String, confidences: [Float]) {
         logger.info("Finishing streaming ASR...")
 
         // Signal end of input
@@ -168,7 +170,7 @@ public actor StreamingAsrManager {
             let finalResult = asrManager.processTranscriptionResult(
                 tokenIds: accumulatedTokens,
                 timestamps: [],
-                confidences: [],  // No per-token confidences needed for final text
+                confidences: accumulatedConfidences,
                 encoderSequenceLength: 0,
                 audioSamples: [],  // Not needed for final text conversion
                 processingTime: 0
@@ -180,7 +182,7 @@ public actor StreamingAsrManager {
         }
 
         logger.info("Final transcription: \(finalText.count) characters")
-        return finalText
+        return (finalText, accumulatedConfidences)
     }
 
     /// Reset the transcriber for a new session
@@ -202,6 +204,7 @@ public actor StreamingAsrManager {
         segmentIndex = 0
         lastProcessedFrame = 0
         accumulatedTokens.removeAll()
+        accumulatedConfidences.removeAll()
 
         logger.info("StreamingAsrManager reset for source: \(String(describing: self.audioSource))")
     }
@@ -330,6 +333,7 @@ public actor StreamingAsrManager {
 
             // Update state
             accumulatedTokens.append(contentsOf: tokens)
+            accumulatedConfidences.append(contentsOf: confidences)
             lastProcessedFrame = max(lastProcessedFrame, adjustedTimestamps.max() ?? 0)
             segmentIndex += 1
 
