@@ -324,7 +324,11 @@ public actor StreamingEouAsrManager {
         return ""
     }
 
-    public func finish() async throws -> String {
+    /// Finish streaming and get the final transcription.
+    /// - Returns: The complete transcription text and per-token confidences.
+    ///   Note: RNNT joint model currently outputs argmax token IDs only — confidences
+    ///   will be empty until the model is re-exported with logits output.
+    public func finish() async throws -> (text: String, confidences: [Float]) {
         // 1. Process remaining audio (padded) if any
         if !audioBuffer.isEmpty {
             let remaining = audioBuffer.count
@@ -344,7 +348,7 @@ public actor StreamingEouAsrManager {
 
         // 2. Return accumulated transcript from incremental decoding
         guard let tokenizer = tokenizer else {
-            return ""
+            return ("", [])
         }
 
         let transcript = tokenizer.decode(ids: accumulatedTokenIds)
@@ -352,7 +356,8 @@ public actor StreamingEouAsrManager {
         // Clear accumulated tokens
         accumulatedTokenIds.removeAll()
 
-        return transcript
+        // No per-token confidences from RNNT decoder yet (joint model outputs argmax only)
+        return (transcript, [])
     }
 
     public func reset() async {

@@ -122,8 +122,9 @@ public actor NemotronStreamingAsrManager {
     // Audio Buffer
     private var audioBuffer: [Float] = []
 
-    // Accumulated token IDs
+    // Accumulated token IDs and per-token confidences
     private var accumulatedTokenIds: [Int] = []
+    private var accumulatedConfidences: [Float] = []
 
     // Encoder cache states
     private var cacheChannel: MLMultiArray?
@@ -200,6 +201,7 @@ public actor NemotronStreamingAsrManager {
     public func reset() async {
         audioBuffer.removeAll()
         accumulatedTokenIds.removeAll()
+        accumulatedConfidences.removeAll()
         processedChunks = 0
         try? resetStates()
     }
@@ -261,8 +263,9 @@ public actor NemotronStreamingAsrManager {
         return ""
     }
 
-    /// Finish processing and return final transcript
-    public func finish() async throws -> String {
+    /// Finish processing and return final transcript with per-token confidences.
+    /// Each confidence is the softmax probability of the chosen token from the joint network logits.
+    public func finish() async throws -> (text: String, confidences: [Float]) {
         // Process remaining audio (padded if needed)
         if !audioBuffer.isEmpty {
             let paddingNeeded = config.chunkSamples - audioBuffer.count
@@ -276,11 +279,13 @@ public actor NemotronStreamingAsrManager {
         }
 
         // Decode accumulated tokens
-        guard let tokenizer = tokenizer else { return "" }
+        guard let tokenizer = tokenizer else { return ("", []) }
         let transcript = tokenizer.decode(ids: accumulatedTokenIds)
+        let confidences = accumulatedConfidences
         accumulatedTokenIds.removeAll()
+        accumulatedConfidences.removeAll()
 
-        return transcript
+        return (transcript, confidences)
     }
 
     /// Get current partial transcript without finishing
@@ -399,8 +404,8 @@ public actor NemotronStreamingAsrManager {
                     throw ASRError.processingFailed("Joint failed")
                 }
 
-                // Argmax to get predicted token
-                let predToken = argmax(logits)
+                // Argmax + confidence from softmax probability of chosen token
+                let (predToken, confidence) = argmaxWithConfidence(logits)
 
                 if predToken == config.blankIdx {
                     // Blank token - move to next encoder frame
@@ -409,6 +414,7 @@ public actor NemotronStreamingAsrManager {
                     // Non-blank token - emit and update state
                     newTokens.append(predToken)
                     accumulatedTokenIds.append(predToken)
+                    accumulatedConfidences.append(confidence)
                     lastToken = Int32(predToken)
                     // Update local variables for next iteration in this chunk
                     currentH = hOut
@@ -552,15 +558,16 @@ public actor NemotronStreamingAsrManager {
         return result
     }
 
-    private func argmax(_ logits: MLMultiArray) -> Int {
+    /// Argmax over logits, returning (tokenIndex, softmaxProbability).
+    /// The probability is the softmax of the chosen token — higher means more confident.
+    private func argmaxWithConfidence(_ logits: MLMultiArray) -> (Int, Float) {
         // logits: [1, 1, 1, vocab_size+1]
         let vocabSize = config.vocabSize + 1  // includes blank
-
         let ptr = logits.dataPointer.bindMemory(to: Float.self, capacity: logits.count)
 
+        // Find max logit (for argmax and numerically stable softmax)
         var maxIdx = 0
         var maxVal = ptr[0]
-
         for i in 1..<vocabSize {
             if ptr[i] > maxVal {
                 maxVal = ptr[i]
@@ -568,6 +575,16 @@ public actor NemotronStreamingAsrManager {
             }
         }
 
-        return maxIdx
+        // Compute softmax denominator: sum(exp(logit - maxLogit))
+        // Using log-sum-exp trick for numerical stability
+        var sumExp: Float = 0
+        for i in 0..<vocabSize {
+            sumExp += exp(ptr[i] - maxVal)
+        }
+
+        // softmax(max) = exp(0) / sumExp = 1 / sumExp
+        let confidence = 1.0 / sumExp
+
+        return (maxIdx, confidence)
     }
 }
