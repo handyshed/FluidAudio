@@ -144,6 +144,8 @@ public actor NemotronStreamingAsrManager {
 
     // Last encoder output (for decoder flush on finish)
     private var lastEncoderOutput: MLMultiArray?
+    // Last encoder output from actual speech (not silence) — used for flush
+    private var lastSpeechEncoderOutput: MLMultiArray?
 
     // Stats
     private var processedChunks: Int = 0
@@ -206,6 +208,7 @@ public actor NemotronStreamingAsrManager {
         accumulatedTokenIds.removeAll()
         accumulatedConfidences.removeAll()
         lastEncoderOutput = nil
+        lastSpeechEncoderOutput = nil
         processedChunks = 0
         try? resetStates()
     }
@@ -283,11 +286,12 @@ public actor NemotronStreamingAsrManager {
         }
 
         // Flush any tokens buffered in the decoder LSTM state.
-        // The RNNT decoder breaks on blank tokens during normal processing,
-        // but the LSTM hidden state may still contain information about
-        // pending tokens that haven't been emitted yet. This runs additional
-        // decoder iterations using the last encoder frame to drain them.
-        if let encoded = lastEncoderOutput {
+        // Use the last SPEECH encoder output (not silence) — the joint network
+        // needs speech context to emit remaining tokens. If silence was fed
+        // after speech, lastEncoderOutput would be from silence and the joint
+        // network would output blanks, losing the final words.
+        let flushEncoder = lastSpeechEncoderOutput ?? lastEncoderOutput
+        if let encoded = flushEncoder {
             try await flushDecoderState(lastEncoderOutput: encoded)
         }
 
@@ -453,6 +457,12 @@ public actor NemotronStreamingAsrManager {
 
         // Save encoder output for potential flush on finish
         lastEncoderOutput = encoded
+
+        // Track whether this chunk has actual speech (non-zero samples)
+        let hasSignal = samples.contains { abs($0) > 1e-6 }
+        if hasSignal {
+            lastSpeechEncoderOutput = encoded
+        }
 
         // 4. RNNT decode loop for each encoder frame
         let numEncoderFrames = encoded.shape[2].intValue
