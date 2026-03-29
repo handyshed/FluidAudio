@@ -142,6 +142,9 @@ public actor NemotronStreamingAsrManager {
     // Callbacks
     private var partialCallback: NemotronPartialCallback?
 
+    // Last encoder output (for decoder flush on finish)
+    private var lastEncoderOutput: MLMultiArray?
+
     // Stats
     private var processedChunks: Int = 0
 
@@ -202,6 +205,7 @@ public actor NemotronStreamingAsrManager {
         audioBuffer.removeAll()
         accumulatedTokenIds.removeAll()
         accumulatedConfidences.removeAll()
+        lastEncoderOutput = nil
         processedChunks = 0
         try? resetStates()
     }
@@ -278,6 +282,15 @@ public actor NemotronStreamingAsrManager {
             audioBuffer.removeAll()
         }
 
+        // Flush any tokens buffered in the decoder LSTM state.
+        // The RNNT decoder breaks on blank tokens during normal processing,
+        // but the LSTM hidden state may still contain information about
+        // pending tokens that haven't been emitted yet. This runs additional
+        // decoder iterations using the last encoder frame to drain them.
+        if let encoded = lastEncoderOutput {
+            try await flushDecoderState(lastEncoderOutput: encoded)
+        }
+
         // Decode accumulated tokens
         guard let tokenizer = tokenizer else { return ("", []) }
         let transcript = tokenizer.decode(ids: accumulatedTokenIds)
@@ -286,6 +299,85 @@ public actor NemotronStreamingAsrManager {
         accumulatedConfidences.removeAll()
 
         return (transcript, confidences)
+    }
+
+    /// Flush buffered tokens from decoder LSTM state after the final encoder frame.
+    /// Runs additional decoder iterations using the last encoder frame to drain any
+    /// tokens that are pending in the LSTM hidden state but haven't been emitted
+    /// because the greedy decode loop broke on a blank token.
+    private func flushDecoderState(lastEncoderOutput encoded: MLMultiArray) async throws {
+        guard let decoder = decoder,
+            let joint = joint,
+            var currentH = hState,
+            var currentC = cState
+        else {
+            return
+        }
+
+        // Use the last encoder frame for all flush iterations
+        let numFrames = encoded.shape[2].intValue
+        guard numFrames > 0 else { return }
+        let encStep = try extractEncoderStep(from: encoded, timeIndex: numFrames - 1)
+
+        var consecutiveBlanks = 0
+        let maxFlushIterations = 20
+
+        for _ in 0..<maxFlushIterations {
+            let tokenInput = try MLMultiArray(shape: [1, 1], dataType: .int32)
+            tokenInput[0] = NSNumber(value: lastToken)
+
+            let tokenLen = try MLMultiArray(shape: [1], dataType: .int32)
+            tokenLen[0] = 1
+
+            let decoderInput = try MLDictionaryFeatureProvider(dictionary: [
+                "token": MLFeatureValue(multiArray: tokenInput),
+                "token_length": MLFeatureValue(multiArray: tokenLen),
+                "h_in": MLFeatureValue(multiArray: currentH),
+                "c_in": MLFeatureValue(multiArray: currentC),
+            ])
+
+            let decoderOutput = try await decoder.prediction(from: decoderInput)
+
+            guard let decoderOut = decoderOutput.featureValue(for: "decoder_out")?.multiArrayValue,
+                let hOut = decoderOutput.featureValue(for: "h_out")?.multiArrayValue,
+                let cOut = decoderOutput.featureValue(for: "c_out")?.multiArrayValue
+            else {
+                return
+            }
+
+            let decoderStep = try sliceDecoderOutput(decoderOut)
+
+            let jointInput = try MLDictionaryFeatureProvider(dictionary: [
+                "encoder": MLFeatureValue(multiArray: encStep),
+                "decoder": MLFeatureValue(multiArray: decoderStep),
+            ])
+
+            let jointOutput = try await joint.prediction(from: jointInput)
+
+            guard let logits = jointOutput.featureValue(for: "logits")?.multiArrayValue else {
+                return
+            }
+
+            let (predToken, confidence) = argmaxWithConfidence(logits)
+
+            if predToken == config.blankIdx {
+                consecutiveBlanks += 1
+                // After 3 consecutive blanks, decoder state is truly drained
+                if consecutiveBlanks >= 3 {
+                    break
+                }
+            } else {
+                accumulatedTokenIds.append(predToken)
+                accumulatedConfidences.append(confidence)
+                lastToken = Int32(predToken)
+                currentH = hOut
+                currentC = cOut
+                consecutiveBlanks = 0
+            }
+        }
+
+        self.hState = currentH
+        self.cState = currentC
     }
 
     /// Get current partial transcript without finishing
@@ -358,6 +450,9 @@ public actor NemotronStreamingAsrManager {
 
         // Save mel cache for next chunk (last 9 frames)
         melCache = try extractMelCache(from: chunkMel)
+
+        // Save encoder output for potential flush on finish
+        lastEncoderOutput = encoded
 
         // 4. RNNT decode loop for each encoder frame
         let numEncoderFrames = encoded.shape[2].intValue
