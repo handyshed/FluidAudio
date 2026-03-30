@@ -27,4 +27,10 @@ public class Tokenizer {
         return text.replacingOccurrences(of: "\u{2581}", with: " ")
             .trimmingCharacters(in: .whitespaces)
     }
+
+    /// Decode a single token ID preserving the raw SentencePiece representation.
+    /// The ▁ prefix indicates a word boundary (start of a new word).
+    public func rawToken(id: Int) -> String {
+        idToToken[id] ?? "<\(id)>"
+    }
 }

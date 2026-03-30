@@ -357,6 +357,11 @@ public actor NemotronStreamingAsrManager {
         tokenizer?.decode(ids: [id]).trimmingCharacters(in: .whitespaces) ?? "<\(id)>"
     }
 
+    /// Decode a single token ID preserving raw SentencePiece representation (▁ prefix = word boundary).
+    public func rawDecodeToken(_ id: Int) -> String {
+        tokenizer?.rawToken(id: id) ?? "<\(id)>"
+    }
+
     /// Flush buffered tokens from decoder LSTM state after the final encoder frame.
     /// Runs additional decoder iterations using the last encoder frame to drain any
     /// tokens that are pending in the LSTM hidden state but haven't been emitted

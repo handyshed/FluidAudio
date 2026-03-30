@@ -88,16 +88,19 @@ public class NemotronTranscribe {
             logger.info("Transcribed in \(String(format: "%.0f", elapsed * 1000))ms")
             logger.info("Text: \(transcript)")
 
-            // Pre-decode all token IDs to strings
+            // Pre-decode all token IDs to strings (both clean and raw with ▁ markers)
             var tokenStrings: [Int: String] = [:]
+            var rawTokenStrings: [Int: String] = [:]
             for alts in alternatives {
                 for alt in alts {
                     if tokenStrings[alt.tokenId] == nil {
                         tokenStrings[alt.tokenId] = await manager.decodeToken(alt.tokenId)
+                        rawTokenStrings[alt.tokenId] = await manager.rawDecodeToken(alt.tokenId)
                     }
                 }
             }
             let decode: (Int) -> String = { tokenStrings[$0] ?? "<\($0)>" }
+            let rawDecode: (Int) -> String = { rawTokenStrings[$0] ?? "<\($0)>" }
 
             if jsonOutput {
                 // Build JSON output with per-token details
@@ -108,6 +111,7 @@ public class NemotronTranscribe {
                     let altDicts: [[String: Any]] = alts.map { alt in
                         [
                             "token": decode(alt.tokenId),
+                            "raw_token": rawDecode(alt.tokenId),
                             "tokenId": alt.tokenId,
                             "probability": alt.probability,
                         ]
