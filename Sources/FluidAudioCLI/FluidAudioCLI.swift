@@ -59,6 +59,8 @@ struct FluidAudioCLI {
             await SortformerBenchmark.run(arguments: Array(arguments.dropFirst(2)))
         case "nemotron-benchmark":
             await NemotronBenchmark.run(arguments: Array(arguments.dropFirst(2)))
+        case "nemotron-transcribe":
+            await NemotronTranscribe.run(arguments: Array(arguments.dropFirst(2)))
         case "help", "--help", "-h":
             printUsage()
         default:
@@ -89,6 +91,7 @@ struct FluidAudioCLI {
                 sortformer              Run Sortformer streaming diarization
                 sortformer-benchmark    Run Sortformer benchmark on AMI dataset
                 nemotron-benchmark      Run Nemotron 0.6B streaming ASR benchmark
+                nemotron-transcribe     Transcribe a WAV file with top-N candidates
                 download                Download evaluation datasets
                 help                    Show this help message
 

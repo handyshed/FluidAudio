@@ -138,6 +138,8 @@ public actor NemotronStreamingAsrManager {
     private var accumulatedConfidences: [Float] = []
     // N-best alternatives per emitted token position
     private var accumulatedAlternatives: [[TokenCandidate]] = []
+    // Raw logits saved during streaming for deferred top-K extraction
+    private var savedLogits: [[Float]] = []
 
     // Encoder cache states
     private var cacheChannel: MLMultiArray?
@@ -221,6 +223,7 @@ public actor NemotronStreamingAsrManager {
         accumulatedTokenIds.removeAll()
         accumulatedConfidences.removeAll()
         accumulatedAlternatives.removeAll()
+        savedLogits.removeAll()
         lastEncoderOutput = nil
         lastSpeechEncoderOutput = nil
         processedChunks = 0
@@ -309,6 +312,33 @@ public actor NemotronStreamingAsrManager {
             try await flushDecoderState(lastEncoderOutput: encoded)
         }
 
+        // Extract top-K alternatives from saved logits (deferred from streaming)
+        let k = 5
+        for logitArray in savedLogits {
+            let vocabSize = logitArray.count
+            var maxVal = logitArray[0]
+            for i in 1..<vocabSize { if logitArray[i] > maxVal { maxVal = logitArray[i] } }
+            var sumExp: Float = 0
+            for i in 0..<vocabSize { sumExp += exp(logitArray[i] - maxVal) }
+
+            var candidates: [(Int, Float)] = []
+            for i in 0..<vocabSize {
+                let prob = exp(logitArray[i] - maxVal) / sumExp
+                if candidates.count < k {
+                    candidates.append((i, prob))
+                    if candidates.count == k { candidates.sort { $0.1 > $1.1 } }
+                } else if prob > candidates[k - 1].1 {
+                    candidates[k - 1] = (i, prob)
+                    candidates.sort { $0.1 > $1.1 }
+                }
+            }
+            if candidates.count < k { candidates.sort { $0.1 > $1.1 } }
+            accumulatedAlternatives.append(
+                candidates.filter { $0.0 != config.blankIdx }
+                    .map { TokenCandidate(tokenId: $0.0, probability: $0.1) }
+            )
+        }
+
         // Decode accumulated tokens
         guard let tokenizer = tokenizer else { return ("", [], [] as [[TokenCandidate]]) }
         let transcript = tokenizer.decode(ids: accumulatedTokenIds)
@@ -317,8 +347,14 @@ public actor NemotronStreamingAsrManager {
         accumulatedTokenIds.removeAll()
         accumulatedConfidences.removeAll()
         accumulatedAlternatives.removeAll()
+        savedLogits.removeAll()
 
         return (transcript, confidences, alternatives)
+    }
+
+    /// Decode a single token ID to its string representation.
+    public func decodeToken(_ id: Int) -> String {
+        tokenizer?.decode(ids: [id]).trimmingCharacters(in: .whitespaces) ?? "<\(id)>"
     }
 
     /// Flush buffered tokens from decoder LSTM state after the final encoder frame.
@@ -536,6 +572,10 @@ public actor NemotronStreamingAsrManager {
                     newTokens.append(predToken)
                     accumulatedTokenIds.append(predToken)
                     accumulatedConfidences.append(confidence)
+                    // Save raw logits for deferred top-K extraction (just a memcpy)
+                    let vocabSize = config.vocabSize + 1
+                    let ptr = logits.dataPointer.bindMemory(to: Float.self, capacity: vocabSize)
+                    savedLogits.append(Array(UnsafeBufferPointer(start: ptr, count: vocabSize)))
                     lastToken = Int32(predToken)
                     // Update local variables for next iteration in this chunk
                     currentH = hOut
