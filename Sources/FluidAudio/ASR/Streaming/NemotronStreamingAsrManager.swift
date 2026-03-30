@@ -102,6 +102,17 @@ public struct NemotronStreamingConfig: Sendable {
 public typealias NemotronPartialCallback = @Sendable (String) -> Void
 
 /// High-level manager for Nemotron Speech Streaming 0.6B pipeline.
+/// A candidate token from the RNNT joint network with its softmax probability.
+public struct TokenCandidate: Sendable {
+    public let tokenId: Int
+    public let probability: Float
+
+    public init(tokenId: Int, probability: Float) {
+        self.tokenId = tokenId
+        self.probability = probability
+    }
+}
+
 /// Implements true streaming with encoder cache states.
 public actor NemotronStreamingAsrManager {
     private let logger = AppLogger(category: "NemotronStreaming")
@@ -125,6 +136,8 @@ public actor NemotronStreamingAsrManager {
     // Accumulated token IDs and per-token confidences
     private var accumulatedTokenIds: [Int] = []
     private var accumulatedConfidences: [Float] = []
+    // N-best alternatives per emitted token position
+    private var accumulatedAlternatives: [[TokenCandidate]] = []
 
     // Encoder cache states
     private var cacheChannel: MLMultiArray?
@@ -207,6 +220,7 @@ public actor NemotronStreamingAsrManager {
         audioBuffer.removeAll()
         accumulatedTokenIds.removeAll()
         accumulatedConfidences.removeAll()
+        accumulatedAlternatives.removeAll()
         lastEncoderOutput = nil
         lastSpeechEncoderOutput = nil
         processedChunks = 0
@@ -272,7 +286,7 @@ public actor NemotronStreamingAsrManager {
 
     /// Finish processing and return final transcript with per-token confidences.
     /// Each confidence is the softmax probability of the chosen token from the joint network logits.
-    public func finish() async throws -> (text: String, confidences: [Float]) {
+    public func finish() async throws -> (text: String, confidences: [Float], alternatives: [[TokenCandidate]]) {
         // Process remaining audio (padded if needed)
         if !audioBuffer.isEmpty {
             let paddingNeeded = config.chunkSamples - audioBuffer.count
@@ -296,13 +310,15 @@ public actor NemotronStreamingAsrManager {
         }
 
         // Decode accumulated tokens
-        guard let tokenizer = tokenizer else { return ("", []) }
+        guard let tokenizer = tokenizer else { return ("", [], [] as [[TokenCandidate]]) }
         let transcript = tokenizer.decode(ids: accumulatedTokenIds)
         let confidences = accumulatedConfidences
+        let alternatives = accumulatedAlternatives
         accumulatedTokenIds.removeAll()
         accumulatedConfidences.removeAll()
+        accumulatedAlternatives.removeAll()
 
-        return (transcript, confidences)
+        return (transcript, confidences, alternatives)
     }
 
     /// Flush buffered tokens from decoder LSTM state after the final encoder frame.
@@ -362,17 +378,18 @@ public actor NemotronStreamingAsrManager {
                 return
             }
 
-            let (predToken, confidence) = argmaxWithConfidence(logits)
+            let candidates = topKWithConfidence(logits, k: 5)
+            let predToken = candidates[0].tokenId
 
             if predToken == config.blankIdx {
                 consecutiveBlanks += 1
-                // After 3 consecutive blanks, decoder state is truly drained
                 if consecutiveBlanks >= 3 {
                     break
                 }
             } else {
                 accumulatedTokenIds.append(predToken)
-                accumulatedConfidences.append(confidence)
+                accumulatedConfidences.append(candidates[0].probability)
+                accumulatedAlternatives.append(candidates.filter { $0.tokenId != config.blankIdx })
                 lastToken = Int32(predToken)
                 currentH = hOut
                 currentC = cOut
@@ -509,8 +526,10 @@ public actor NemotronStreamingAsrManager {
                     throw ASRError.processingFailed("Joint failed")
                 }
 
-                // Argmax + confidence from softmax probability of chosen token
-                let (predToken, confidence) = argmaxWithConfidence(logits)
+                // Top-K candidates from softmax over joint network logits
+                let candidates = topKWithConfidence(logits, k: 5)
+                let predToken = candidates[0].tokenId
+                let confidence = candidates[0].probability
 
                 if predToken == config.blankIdx {
                     // Blank token - move to next encoder frame
@@ -520,6 +539,8 @@ public actor NemotronStreamingAsrManager {
                     newTokens.append(predToken)
                     accumulatedTokenIds.append(predToken)
                     accumulatedConfidences.append(confidence)
+                    // Store alternatives (excluding blank token)
+                    accumulatedAlternatives.append(candidates.filter { $0.tokenId != config.blankIdx })
                     lastToken = Int32(predToken)
                     // Update local variables for next iteration in this chunk
                     currentH = hOut
@@ -666,30 +687,52 @@ public actor NemotronStreamingAsrManager {
     /// Argmax over logits, returning (tokenIndex, softmaxProbability).
     /// The probability is the softmax of the chosen token — higher means more confident.
     private func argmaxWithConfidence(_ logits: MLMultiArray) -> (Int, Float) {
-        // logits: [1, 1, 1, vocab_size+1]
+        let result = topKWithConfidence(logits, k: 1)
+        return (result[0].tokenId, result[0].probability)
+    }
+
+    /// Top-K tokens from joint network logits with softmax probabilities.
+    /// Returns candidates sorted by probability (highest first).
+    /// The blank token is included if it's in the top-K.
+    private func topKWithConfidence(_ logits: MLMultiArray, k: Int) -> [TokenCandidate] {
         let vocabSize = config.vocabSize + 1  // includes blank
         let ptr = logits.dataPointer.bindMemory(to: Float.self, capacity: logits.count)
 
-        // Find max logit (for argmax and numerically stable softmax)
-        var maxIdx = 0
+        // Find max logit for numerically stable softmax
         var maxVal = ptr[0]
         for i in 1..<vocabSize {
-            if ptr[i] > maxVal {
-                maxVal = ptr[i]
-                maxIdx = i
-            }
+            if ptr[i] > maxVal { maxVal = ptr[i] }
         }
 
-        // Compute softmax denominator: sum(exp(logit - maxLogit))
-        // Using log-sum-exp trick for numerical stability
+        // Compute softmax denominator
         var sumExp: Float = 0
         for i in 0..<vocabSize {
             sumExp += exp(ptr[i] - maxVal)
         }
 
-        // softmax(max) = exp(0) / sumExp = 1 / sumExp
-        let confidence = 1.0 / sumExp
+        // Build (index, probability) pairs and partial sort for top-K
+        // For small K, a simple selection is faster than full sort
+        var candidates: [(Int, Float)] = []
+        candidates.reserveCapacity(k)
 
-        return (maxIdx, confidence)
+        for i in 0..<vocabSize {
+            let prob = exp(ptr[i] - maxVal) / sumExp
+            if candidates.count < k {
+                candidates.append((i, prob))
+                if candidates.count == k {
+                    candidates.sort { $0.1 > $1.1 }
+                }
+            } else if prob > candidates[k - 1].1 {
+                candidates[k - 1] = (i, prob)
+                // Re-sort to maintain order
+                candidates.sort { $0.1 > $1.1 }
+            }
+        }
+
+        if candidates.count < k {
+            candidates.sort { $0.1 > $1.1 }
+        }
+
+        return candidates.map { TokenCandidate(tokenId: $0.0, probability: $0.1) }
     }
 }
