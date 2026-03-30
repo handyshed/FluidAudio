@@ -473,9 +473,10 @@ public actor NemotronStreamingAsrManager {
         // Save encoder output for potential flush on finish
         lastEncoderOutput = encoded
 
-        // Track whether this chunk has actual speech (non-zero samples)
-        let hasSignal = samples.contains { abs($0) > 1e-6 }
-        if hasSignal {
+        // Save speech encoder output for flush — skip if chunk is pure silence.
+        // Quick check: just test a few samples rather than scanning all 2560.
+        let spot = samples.count / 2
+        if spot < samples.count && abs(samples[spot]) > 1e-6 {
             lastSpeechEncoderOutput = encoded
         }
 
