@@ -161,6 +161,8 @@ public actor NemotronStreamingAsrManager {
     private var lastEncoderOutput: MLMultiArray?
     // Last encoder output from actual speech (not silence) — used for flush
     private var lastSpeechEncoderOutput: MLMultiArray?
+    // Deferred token reset after sentence-ending punctuation
+    private var needsTokenReset = false
 
     // Stats
     private var processedChunks: Int = 0
@@ -226,6 +228,7 @@ public actor NemotronStreamingAsrManager {
         savedLogits.removeAll()
         lastEncoderOutput = nil
         lastSpeechEncoderOutput = nil
+        needsTokenReset = false
         processedChunks = 0
         try? resetStates()
     }
@@ -514,11 +517,19 @@ public actor NemotronStreamingAsrManager {
         // Save encoder output for potential flush on finish
         lastEncoderOutput = encoded
 
-        // Save speech encoder output for flush — skip if chunk is pure silence.
-        // Quick check: just test a few samples rather than scanning all 2560.
+        // Check if chunk has speech (for deferred reset + speech encoder tracking)
         let spot = samples.count / 2
-        if spot < samples.count && abs(samples[spot]) > 1e-6 {
+        let hasSignal = spot < samples.count && abs(samples[spot]) > 1e-6
+
+        // Save speech encoder output for flush — skip if chunk is pure silence
+        if hasSignal {
             lastSpeechEncoderOutput = encoded
+        }
+
+        // Apply deferred token reset when new speech arrives after sentence-end
+        if needsTokenReset && hasSignal {
+            lastToken = 941  // ▁ (space token)
+            needsTokenReset = false
         }
 
         // 4. RNNT decode loop for each encoder frame
@@ -572,19 +583,41 @@ public actor NemotronStreamingAsrManager {
                 if predToken == config.blankIdx {
                     // Blank token - move to next encoder frame
                     break
-                } else {
-                    // Non-blank token - emit and update state
-                    newTokens.append(predToken)
-                    accumulatedTokenIds.append(predToken)
-                    accumulatedConfidences.append(confidence)
-                    // Save raw logits for deferred top-K extraction (just a memcpy)
-                    let vocabSize = config.vocabSize + 1
-                    let ptr = logits.dataPointer.bindMemory(to: Float.self, capacity: vocabSize)
-                    savedLogits.append(Array(UnsafeBufferPointer(start: ptr, count: vocabSize)))
+                } else if predToken == 0 || (needsTokenReset && !hasSignal) {
+                    // <unk> token or junk emitted during sentence boundary silence — suppress
                     lastToken = Int32(predToken)
-                    // Update local variables for next iteration in this chunk
                     currentH = hOut
                     currentC = cOut
+                } else {
+                    // Suppress duplicate sentence-end punctuation after reset
+                    let sentenceEnd: Set<Int> = [962, 977, 976]  // . ? !
+                    let lastAccumulated = accumulatedTokenIds.last ?? -1
+                    if sentenceEnd.contains(predToken) && sentenceEnd.contains(lastAccumulated) {
+                        // Duplicate punctuation after sentence boundary — skip
+                        lastToken = Int32(predToken)
+                        currentH = hOut
+                        currentC = cOut
+                    } else {
+                        // Normal token — emit
+                        newTokens.append(predToken)
+                        accumulatedTokenIds.append(predToken)
+                        accumulatedConfidences.append(confidence)
+                        // Save raw logits for deferred top-K extraction
+                        let vocabSize = config.vocabSize + 1
+                        let ptr = logits.dataPointer.bindMemory(to: Float.self, capacity: vocabSize)
+                        savedLogits.append(Array(UnsafeBufferPointer(start: ptr, count: vocabSize)))
+                        lastToken = Int32(predToken)
+
+                        // After sentence-ending punctuation, mark for deferred reset.
+                        // The actual reset happens when the next speech chunk arrives,
+                        // preventing hallucination during trailing silence.
+                        if sentenceEnd.contains(predToken) {
+                            needsTokenReset = true
+                        }
+
+                        currentH = hOut
+                        currentC = cOut
+                    }
                 }
             }
         }
@@ -592,6 +625,12 @@ public actor NemotronStreamingAsrManager {
         // Save final decoder state back to actor properties for next chunk
         self.hState = currentH
         self.cState = currentC
+
+        // Debug: log tokens per chunk
+        if !newTokens.isEmpty {
+            let tokenStr = newTokens.map { tokenizer?.rawToken(id: $0) ?? "\($0)" }.joined()
+            logger.debug("Chunk \(processedChunks): \(newTokens.count) tokens: \(tokenStr)")
+        }
 
         // Invoke partial callback if new tokens were decoded
         if !newTokens.isEmpty, let callback = partialCallback, let tokenizer = tokenizer {

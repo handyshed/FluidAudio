@@ -24,8 +24,36 @@ public class Tokenizer {
             }
         }
         // Replace SentencePiece word boundary marker with space, then trim
-        return text.replacingOccurrences(of: "\u{2581}", with: " ")
+        var result = text.replacingOccurrences(of: "\u{2581}", with: " ")
             .trimmingCharacters(in: .whitespaces)
+
+        // Clean up sentence boundary artifacts from multi-sentence decoding:
+        // Remove stray tokens between sentence-end punctuation and next word
+        // e.g. "fine.- but" → "fine. But", "this?ice three" → "this? Three"
+        let pattern = "([.?!])([^\\s.?!A-Z][^\\s]*)?\\s+"
+        if let regex = try? NSRegularExpression(pattern: pattern) {
+            result = regex.stringByReplacingMatches(
+                in: result, range: NSRange(result.startIndex..., in: result),
+                withTemplate: "$1 "
+            )
+        }
+
+        // Capitalize first letter after sentence-ending punctuation
+        let capPattern = "([.?!])\\s+([a-z])"
+        if let regex = try? NSRegularExpression(pattern: capPattern) {
+            let mutable = NSMutableString(string: result)
+            let matches = regex.matches(in: result, range: NSRange(result.startIndex..., in: result))
+            for match in matches.reversed() {
+                let letterRange = match.range(at: 2)
+                if let range = Range(letterRange, in: result) {
+                    let upper = result[range].uppercased()
+                    mutable.replaceCharacters(in: letterRange, with: upper)
+                }
+            }
+            result = mutable as String
+        }
+
+        return result
     }
 
     /// Decode a single token ID preserving the raw SentencePiece representation.
