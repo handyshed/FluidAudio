@@ -378,8 +378,7 @@ public actor NemotronStreamingAsrManager {
                 return
             }
 
-            let candidates = topKWithConfidence(logits, k: 5)
-            let predToken = candidates[0].tokenId
+            let (predToken, confidence) = argmaxWithConfidence(logits)
 
             if predToken == config.blankIdx {
                 consecutiveBlanks += 1
@@ -388,8 +387,7 @@ public actor NemotronStreamingAsrManager {
                 }
             } else {
                 accumulatedTokenIds.append(predToken)
-                accumulatedConfidences.append(candidates[0].probability)
-                accumulatedAlternatives.append(candidates.filter { $0.tokenId != config.blankIdx })
+                accumulatedConfidences.append(confidence)
                 lastToken = Int32(predToken)
                 currentH = hOut
                 currentC = cOut
@@ -526,10 +524,8 @@ public actor NemotronStreamingAsrManager {
                     throw ASRError.processingFailed("Joint failed")
                 }
 
-                // Top-K candidates from softmax over joint network logits
-                let candidates = topKWithConfidence(logits, k: 5)
-                let predToken = candidates[0].tokenId
-                let confidence = candidates[0].probability
+                // Argmax + confidence from softmax probability of chosen token
+                let (predToken, confidence) = argmaxWithConfidence(logits)
 
                 if predToken == config.blankIdx {
                     // Blank token - move to next encoder frame
@@ -539,8 +535,6 @@ public actor NemotronStreamingAsrManager {
                     newTokens.append(predToken)
                     accumulatedTokenIds.append(predToken)
                     accumulatedConfidences.append(confidence)
-                    // Store alternatives (excluding blank token)
-                    accumulatedAlternatives.append(candidates.filter { $0.tokenId != config.blankIdx })
                     lastToken = Int32(predToken)
                     // Update local variables for next iteration in this chunk
                     currentH = hOut
