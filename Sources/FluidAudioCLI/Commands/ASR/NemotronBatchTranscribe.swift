@@ -127,7 +127,7 @@ public class NemotronBatchTranscribe {
                     let processMs = (CFAbsoluteTimeGetCurrent() - t1) * 1000
 
                     let t2 = CFAbsoluteTimeGetCurrent()
-                    let (transcript, confidences, alternatives) = try await manager.finish()
+                    let (transcript, confidences, alternatives, _) = try await manager.finish()
                     let finishMs = (CFAbsoluteTimeGetCurrent() - t2) * 1000
 
                     let t3 = CFAbsoluteTimeGetCurrent()

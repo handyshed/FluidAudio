@@ -135,6 +135,8 @@ public actor NemotronStreamingAsrManager {
 
     // Accumulated token IDs and per-token confidences
     private var accumulatedTokenIds: [Int] = []
+    private var accumulatedTokenTimestamps: [Int] = []  // ms timestamp for each token
+    private var totalMelFramesProcessed: Int = 0
     private var accumulatedConfidences: [Float] = []
     // N-best alternatives per emitted token position
     private var accumulatedAlternatives: [[TokenCandidate]] = []
@@ -223,6 +225,8 @@ public actor NemotronStreamingAsrManager {
         accumulatedTokenIds.removeAll()
         accumulatedConfidences.removeAll()
         accumulatedAlternatives.removeAll()
+        accumulatedTokenTimestamps.removeAll()
+        totalMelFramesProcessed = 0
         savedLogits.removeAll()
         lastEncoderOutput = nil
         lastSpeechEncoderOutput = nil
@@ -236,6 +240,8 @@ public actor NemotronStreamingAsrManager {
         accumulatedTokenIds.removeAll(keepingCapacity: true)
         accumulatedConfidences.removeAll(keepingCapacity: true)
         accumulatedAlternatives.removeAll(keepingCapacity: true)
+        accumulatedTokenTimestamps.removeAll(keepingCapacity: true)
+        totalMelFramesProcessed = 0
         savedLogits.removeAll(keepingCapacity: true)
         lastEncoderOutput = nil
         lastSpeechEncoderOutput = nil
@@ -323,7 +329,7 @@ public actor NemotronStreamingAsrManager {
 
     /// Finish processing and return final transcript with per-token confidences.
     /// Each confidence is the softmax probability of the chosen token from the joint network logits.
-    public func finish() async throws -> (text: String, confidences: [Float], alternatives: [[TokenCandidate]]) {
+    public func finish() async throws -> (text: String, confidences: [Float], alternatives: [[TokenCandidate]], timestamps: [Int]) {
         // Process remaining audio (padded if needed)
         if !audioBuffer.isEmpty {
             let paddingNeeded = config.chunkSamples - audioBuffer.count
@@ -374,16 +380,19 @@ public actor NemotronStreamingAsrManager {
         }
 
         // Decode accumulated tokens
-        guard let tokenizer = tokenizer else { return ("", [], [] as [[TokenCandidate]]) }
+        guard let tokenizer = tokenizer else { return ("", [], [] as [[TokenCandidate]], []) }
         let transcript = tokenizer.decode(ids: accumulatedTokenIds)
         let confidences = accumulatedConfidences
         let alternatives = accumulatedAlternatives
+        let timestamps = accumulatedTokenTimestamps
         accumulatedTokenIds.removeAll()
         accumulatedConfidences.removeAll()
         accumulatedAlternatives.removeAll()
+        accumulatedTokenTimestamps.removeAll()
+        totalMelFramesProcessed = 0
         savedLogits.removeAll()
 
-        return (transcript, confidences, alternatives)
+        return (transcript, confidences, alternatives, timestamps)
     }
 
     /// Decode a single token ID to its string representation.
@@ -611,6 +620,9 @@ public actor NemotronStreamingAsrManager {
                     newTokens.append(predToken)
                     accumulatedTokenIds.append(predToken)
                     accumulatedConfidences.append(confidence)
+                    // Record timestamp: each mel frame = 10ms
+                    let timestampMs = (totalMelFramesProcessed + t) * 10
+                    accumulatedTokenTimestamps.append(timestampMs)
                     // Save raw logits for deferred top-K extraction (just a memcpy)
                     if !skipLogitSaving {
                         let vocabSize = config.vocabSize + 1
@@ -624,6 +636,9 @@ public actor NemotronStreamingAsrManager {
                 }
             }
         }
+
+        // Update total mel frames processed (for token timestamps)
+        totalMelFramesProcessed += numEncoderFrames
 
         // Save final decoder state back to actor properties for next chunk
         self.hState = currentH

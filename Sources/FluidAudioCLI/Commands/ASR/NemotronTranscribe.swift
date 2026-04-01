@@ -82,7 +82,7 @@ public class NemotronTranscribe {
             // Process
             let startTime = Date()
             _ = try await manager.process(audioBuffer: buffer)
-            let (transcript, confidences, alternatives) = try await manager.finish()
+            let (transcript, confidences, alternatives, timestamps) = try await manager.finish()
             let elapsed = Date().timeIntervalSince(startTime)
 
             logger.info("Transcribed in \(String(format: "%.0f", elapsed * 1000))ms")
@@ -116,11 +116,15 @@ public class NemotronTranscribe {
                             "probability": alt.probability,
                         ]
                     }
-                    tokens.append([
+                    var tokenDict: [String: Any] = [
                         "position": idx,
                         "confidence": conf,
                         "alternatives": altDicts,
-                    ])
+                    ]
+                    if idx < timestamps.count {
+                        tokenDict["timestamp_ms"] = timestamps[idx]
+                    }
+                    tokens.append(tokenDict)
                 }
 
                 let output: [String: Any] = [
