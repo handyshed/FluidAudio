@@ -217,7 +217,7 @@ public actor NemotronStreamingAsrManager {
         logger.info("Nemotron models loaded successfully (\(config.chunkMs)ms chunks).")
     }
 
-    /// Reset all states for a new transcription session
+    /// Reset all states for a new transcription session.
     public func reset() async {
         audioBuffer.removeAll()
         accumulatedTokenIds.removeAll()
@@ -228,6 +228,27 @@ public actor NemotronStreamingAsrManager {
         lastSpeechEncoderOutput = nil
         processedChunks = 0
         try? resetStates()
+    }
+
+    /// Fast reset for batch processing — zeros existing buffers without reallocating.
+    public func resetFast() {
+        audioBuffer.removeAll(keepingCapacity: true)
+        accumulatedTokenIds.removeAll(keepingCapacity: true)
+        accumulatedConfidences.removeAll(keepingCapacity: true)
+        accumulatedAlternatives.removeAll(keepingCapacity: true)
+        savedLogits.removeAll(keepingCapacity: true)
+        lastEncoderOutput = nil
+        lastSpeechEncoderOutput = nil
+        melCache = nil
+        processedChunks = 0
+        lastToken = Int32(config.blankIdx)
+
+        // Zero existing tensors instead of reallocating
+        if let c = cacheChannel { c.reset(to: 0) }
+        if let t = cacheTime { t.reset(to: 0) }
+        if let l = cacheLen { l[0] = 0 }
+        if let h = hState { h.reset(to: 0) }
+        if let c = cState { c.reset(to: 0) }
     }
 
     private func resetStates() throws {
@@ -275,6 +296,19 @@ public actor NemotronStreamingAsrManager {
     /// Process audio and return partial transcript
     public func process(audioBuffer: AVAudioPCMBuffer) async throws -> String {
         let samples = try audioConverter.resampleBuffer(audioBuffer)
+        return try await processSamples(samples)
+    }
+
+    /// Skip saving logits for faster batch processing (no top-K extraction in finish).
+    private var skipLogitSaving = false
+
+    public func setSkipLogitSaving(_ skip: Bool) {
+        skipLogitSaving = skip
+    }
+
+    /// Process raw 16kHz Float32 mono samples directly — skips resampling.
+    /// Use when audio is already in the correct format.
+    public func processSamples(_ samples: [Float]) async throws -> String {
         self.audioBuffer.append(contentsOf: samples)
 
         // Process complete chunks
@@ -578,9 +612,11 @@ public actor NemotronStreamingAsrManager {
                     accumulatedTokenIds.append(predToken)
                     accumulatedConfidences.append(confidence)
                     // Save raw logits for deferred top-K extraction (just a memcpy)
-                    let vocabSize = config.vocabSize + 1
-                    let ptr = logits.dataPointer.bindMemory(to: Float.self, capacity: vocabSize)
-                    savedLogits.append(Array(UnsafeBufferPointer(start: ptr, count: vocabSize)))
+                    if !skipLogitSaving {
+                        let vocabSize = config.vocabSize + 1
+                        let ptr = logits.dataPointer.bindMemory(to: Float.self, capacity: vocabSize)
+                        savedLogits.append(Array(UnsafeBufferPointer(start: ptr, count: vocabSize)))
+                    }
                     lastToken = Int32(predToken)
                     // Update local variables for next iteration in this chunk
                     currentH = hOut

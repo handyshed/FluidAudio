@@ -61,6 +61,8 @@ struct FluidAudioCLI {
             await NemotronBenchmark.run(arguments: Array(arguments.dropFirst(2)))
         case "nemotron-transcribe":
             await NemotronTranscribe.run(arguments: Array(arguments.dropFirst(2)))
+        case "nemotron-batch":
+            await NemotronBatchTranscribe.run(arguments: Array(arguments.dropFirst(2)))
         case "help", "--help", "-h":
             printUsage()
         default:
