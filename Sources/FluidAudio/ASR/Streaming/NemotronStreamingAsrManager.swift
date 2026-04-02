@@ -353,7 +353,7 @@ public actor NemotronStreamingAsrManager {
         }
 
         // Extract top-K alternatives from saved logits (deferred from streaming)
-        let k = 5
+        let k = 16
         for logitArray in savedLogits {
             let vocabSize = logitArray.count
             var maxVal = logitArray[0]

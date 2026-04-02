@@ -127,7 +127,7 @@ public class NemotronBatchTranscribe {
                     let processMs = (CFAbsoluteTimeGetCurrent() - t1) * 1000
 
                     let t2 = CFAbsoluteTimeGetCurrent()
-                    let (transcript, confidences, alternatives, _) = try await manager.finish()
+                    let (transcript, confidences, alternatives, timestamps) = try await manager.finish()
                     let finishMs = (CFAbsoluteTimeGetCurrent() - t2) * 1000
 
                     let t3 = CFAbsoluteTimeGetCurrent()
@@ -164,7 +164,11 @@ public class NemotronBatchTranscribe {
                                     "p": alt.probability,
                                 ]
                             }
-                            tokens.append(["c": conf, "a": altDicts])
+                            var tokDict: [String: Any] = ["c": conf, "a": altDicts]
+                            if tidx < timestamps.count {
+                                tokDict["ms"] = timestamps[tidx]
+                            }
+                            tokens.append(tokDict)
                         }
                         pair["tokens"] = tokens
                     }
