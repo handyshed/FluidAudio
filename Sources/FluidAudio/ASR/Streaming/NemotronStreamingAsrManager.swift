@@ -113,6 +113,26 @@ public struct TokenCandidate: Sendable {
     }
 }
 
+/// Incremental transcript snapshot emitted during streaming.
+/// Used for preview-only work (e.g., speculative punctuation) while speech continues.
+/// Final deterministic output still comes from `finish()`.
+public struct StreamingTranscriptSnapshot: Sendable {
+    /// Monotonically increasing revision number. Host can ignore stale updates.
+    public let revision: Int
+    /// Current accumulated transcript text.
+    public let text: String
+    /// Raw token IDs (SentencePiece).
+    public let tokenIds: [Int]
+    /// Per-token confidence scores.
+    public let confidences: [Float]
+    /// Per-token timestamps in Nemotron frame units (~8ms each).
+    public let timestampsMs: [Int]
+    /// Always false for partial snapshots. Final output comes from finish().
+    public let isFinal: Bool
+}
+
+public typealias NemotronSnapshotCallback = @Sendable (StreamingTranscriptSnapshot) -> Void
+
 /// Implements true streaming with encoder cache states.
 public actor NemotronStreamingAsrManager {
     private let logger = AppLogger(category: "NemotronStreaming")
@@ -158,6 +178,8 @@ public actor NemotronStreamingAsrManager {
 
     // Callbacks
     private var partialCallback: NemotronPartialCallback?
+    private var snapshotCallback: NemotronSnapshotCallback?
+    private var snapshotRevision: Int = 0
 
     // Last encoder output (for decoder flush on finish)
     private var lastEncoderOutput: MLMultiArray?
@@ -175,9 +197,16 @@ public actor NemotronStreamingAsrManager {
         self.lastToken = Int32(config.blankIdx)
     }
 
-    /// Set callback for partial transcription updates
+    /// Set callback for partial transcription updates (text only).
     public func setPartialCallback(_ callback: @escaping NemotronPartialCallback) {
         self.partialCallback = callback
+    }
+
+    /// Set callback for structured incremental snapshots.
+    /// Emitted whenever new tokens are decoded. Includes text, confidences, timestamps.
+    /// For preview-only work — final output still comes from finish().
+    public func setPartialSnapshotCallback(_ callback: @escaping NemotronSnapshotCallback) {
+        self.snapshotCallback = callback
     }
 
     /// Load models from a directory containing preprocessor, encoder, decoder, joint, and tokenizer
@@ -231,6 +260,7 @@ public actor NemotronStreamingAsrManager {
         lastEncoderOutput = nil
         lastSpeechEncoderOutput = nil
         processedChunks = 0
+        snapshotRevision = 0
         try? resetStates()
     }
 
@@ -644,10 +674,24 @@ public actor NemotronStreamingAsrManager {
         self.hState = currentH
         self.cState = currentC
 
-        // Invoke partial callback if new tokens were decoded
-        if !newTokens.isEmpty, let callback = partialCallback, let tokenizer = tokenizer {
-            let partial = tokenizer.decode(ids: accumulatedTokenIds)
-            callback(partial)
+        // Invoke partial callbacks if new tokens were decoded
+        if !newTokens.isEmpty {
+            if let callback = partialCallback, let tokenizer = tokenizer {
+                let partial = tokenizer.decode(ids: accumulatedTokenIds)
+                callback(partial)
+            }
+            if let snapshotCb = snapshotCallback, let tokenizer = tokenizer {
+                snapshotRevision += 1
+                let snapshot = StreamingTranscriptSnapshot(
+                    revision: snapshotRevision,
+                    text: tokenizer.decode(ids: accumulatedTokenIds),
+                    tokenIds: accumulatedTokenIds,
+                    confidences: accumulatedConfidences,
+                    timestampsMs: accumulatedTokenTimestamps,
+                    isFinal: false
+                )
+                snapshotCb(snapshot)
+            }
         }
 
         processedChunks += 1
