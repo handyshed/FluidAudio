@@ -347,11 +347,22 @@ public actor NemotronStreamingAsrManager {
     public func processSamples(_ samples: [Float]) async throws -> String {
         self.audioBuffer.append(contentsOf: samples)
 
-        // Process complete chunks
+        // Process complete chunks. We pop each chunk off the buffer BEFORE the
+        // `await processChunk(chunk)` call — not after — so the buffer mutation
+        // is atomic relative to actor reentrancy. If a concurrent processSamples
+        // call enters the actor while processChunk is awaiting, it sees the
+        // already-advanced buffer and operates on fresh samples instead of
+        // racing for the same prefix.
+        //
+        // The previous order (prefix → await → removeFirst) crashed with
+        // "Can't remove more items from a collection than it has" when two
+        // concurrent processSamples calls overlapped: both saw the same
+        // prefix, both awaited processChunk, both resumed and called
+        // removeFirst(chunkSamples), one of them underflowing the buffer.
         while self.audioBuffer.count >= config.chunkSamples {
             let chunk = Array(self.audioBuffer.prefix(config.chunkSamples))
-            try await processChunk(chunk)
             self.audioBuffer.removeFirst(config.chunkSamples)
+            try await processChunk(chunk)
         }
 
         return ""
@@ -360,7 +371,9 @@ public actor NemotronStreamingAsrManager {
     /// Finish processing and return final transcript with per-token confidences.
     /// Each confidence is the softmax probability of the chosen token from the joint network logits.
     public func finish() async throws -> (text: String, confidences: [Float], alternatives: [[TokenCandidate]], timestamps: [Int]) {
-        // Process remaining audio (padded if needed)
+        // Process remaining audio (padded if needed). Same reentrancy discipline
+        // as processSamples: drain the buffer BEFORE the await so a concurrent
+        // call can't see stale samples while processChunk is suspended.
         if !audioBuffer.isEmpty {
             let paddingNeeded = config.chunkSamples - audioBuffer.count
             if paddingNeeded > 0 {
@@ -368,8 +381,8 @@ public actor NemotronStreamingAsrManager {
             }
 
             let chunk = Array(audioBuffer.prefix(config.chunkSamples))
-            try await processChunk(chunk)
             audioBuffer.removeAll()
+            try await processChunk(chunk)
         }
 
         // Flush any tokens buffered in the decoder LSTM state.
