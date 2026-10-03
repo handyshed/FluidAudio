@@ -41,11 +41,76 @@ public enum ModelRegistry {
         }
     }
 
+    // MARK: - Repository Overrides
+
+    // Mutable static for runtime configuration, matching the `_customBaseURL` pattern above.
+    nonisolated(unsafe) private static var _repoOverrides: [String: String] = [:]
+    nonisolated(unsafe) private static var _revisionOverrides: [String: String] = [:]
+
+    /// Maps upstream repository paths to alternates, e.g. a mirror under a different owner.
+    ///
+    /// `baseURL` only repoints the *host*, but repository paths come from the hardcoded `Repo`
+    /// enum, so a mirror hosted under a different owner on the same registry is unreachable
+    /// without this. Matching is longest-prefix, so mapping a repo also maps its subpaths
+    /// (e.g. `…/parakeet-realtime-eou-120m-coreml/160ms`).
+    ///
+    /// Repositories with no mapping resolve upstream unchanged, so a partial mirror is safe.
+    ///
+    ///     ModelRegistry.repoOverrides = [
+    ///         "FluidInference/parakeet-tdt-0.6b-v3-coreml": "DictionLabs/parakeet-tdt-0.6b-v3-coreml"
+    ///     ]
+    public static var repoOverrides: [String: String] {
+        get { _repoOverrides }
+        set { _repoOverrides = newValue }
+    }
+
+    /// Maps upstream repository paths to revisions available on a configured mirror.
+    ///
+    /// FluidAudio pins selected upstream repositories to immutable commits. A mirror
+    /// that does not preserve those Git commits must provide its corresponding ref
+    /// here. Keys use the original `FluidInference/...` path and follow the same
+    /// longest-prefix matching rules as ``repoOverrides``.
+    ///
+    ///     ModelRegistry.revisionOverrides = [
+    ///         "FluidInference/speaker-diarization-coreml": "main"
+    ///     ]
+    public static var revisionOverrides: [String: String] {
+        get { _revisionOverrides }
+        set { _revisionOverrides = newValue }
+    }
+
+    /// Applies `repoOverrides` to a repository path. Longest key wins, so a more specific
+    /// mapping always beats a broader one regardless of dictionary ordering.
+    static func mapRepoPath(_ repoPath: String) -> String {
+        guard !_repoOverrides.isEmpty else { return repoPath }
+        for from in _repoOverrides.keys.sorted(by: { $0.count > $1.count }) {
+            guard let to = _repoOverrides[from] else { continue }
+            if repoPath == from {
+                return to
+            }
+            if repoPath.hasPrefix(from + "/") {
+                return to + repoPath.dropFirst(from.count)
+            }
+        }
+        return repoPath
+    }
+
+    /// Resolve the revision for an original repository path before any path override.
+    static func mapRevision(_ repoPath: String, default defaultRevision: String) -> String {
+        for from in _revisionOverrides.keys.sorted(by: { $0.count > $1.count }) {
+            guard let revision = _revisionOverrides[from] else { continue }
+            if repoPath == from || repoPath.hasPrefix(from + "/") {
+                return revision
+            }
+        }
+        return defaultRevision
+    }
+
     // MARK: - URL Construction
 
     /// Construct API URL for listing model repository contents
     public static func apiModels(_ repoPath: String, _ apiPath: String) throws -> URL {
-        let urlString = "\(baseURL)/api/models/\(repoPath)/\(apiPath)"
+        let urlString = "\(baseURL)/api/models/\(mapRepoPath(repoPath))/\(apiPath)"
         guard let url = URL(string: urlString) else {
             throw Error.invalidURL(urlString)
         }
@@ -53,8 +118,12 @@ public enum ModelRegistry {
     }
 
     /// Construct download URL for a model file
-    public static func resolveModel(_ repoPath: String, _ filePath: String) throws -> URL {
-        let urlString = "\(baseURL)/\(repoPath)/resolve/main/\(filePath)"
+    public static func resolveModel(
+        _ repoPath: String,
+        _ filePath: String,
+        revision: String = "main"
+    ) throws -> URL {
+        let urlString = "\(baseURL)/\(mapRepoPath(repoPath))/resolve/\(revision)/\(filePath)"
         guard let url = URL(string: urlString) else {
             throw Error.invalidURL(urlString)
         }
@@ -71,8 +140,10 @@ public enum ModelRegistry {
     }
 
     /// Construct download URL for a dataset file
-    public static func resolveDataset(_ dataset: String, _ filePath: String) throws -> URL {
-        let urlString = "\(baseURL)/datasets/\(dataset)/resolve/main/\(filePath)"
+    public static func resolveDataset(
+        _ dataset: String, _ filePath: String, revision: String = "main"
+    ) throws -> URL {
+        let urlString = "\(baseURL)/datasets/\(dataset)/resolve/\(revision)/\(filePath)"
         guard let url = URL(string: urlString) else {
             throw Error.invalidURL(urlString)
         }
@@ -80,8 +151,8 @@ public enum ModelRegistry {
     }
 
     /// Construct base URL for dataset directory (without trailing slash)
-    public static func resolveDatasetBase(_ dataset: String) -> String {
-        "\(baseURL)/datasets/\(dataset)/resolve/main"
+    public static func resolveDatasetBase(_ dataset: String, revision: String = "main") -> String {
+        "\(baseURL)/datasets/\(dataset)/resolve/\(revision)"
     }
 
     // MARK: - Session Configuration

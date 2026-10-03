@@ -58,12 +58,14 @@ extension SortformerModels {
     /// - Parameters:
     ///   - preprocessorPath: Path to SortformerPreprocessor.mlpackage
     ///   - mainModelPath: Path to Sortformer.mlpackage
-    ///   - configuration: Optional MLModel configuration
+    ///   - computeUnits: CoreML compute units. Pass `nil` (default) to auto-resolve via
+    ///     `recommendedComputeUnits(for:)`, which avoids the multi-minute ANE compile hang on
+    ///     RAM-constrained devices for the large fp16 high-context variants (issue #726).
     /// - Returns: Loaded SortformerModels
     public static func load(
         config: SortformerConfig,
         mainModelPath: URL,
-        configuration: MLModelConfiguration? = nil
+        computeUnits: MLComputeUnits? = nil
     ) async throws -> SortformerModels {
         logger.info("Loading Sortformer models from local paths (combined pipeline mode)")
 
@@ -73,11 +75,10 @@ extension SortformerModels {
         logger.info("Compiling main model...")
         let compiledMainModelURL = try await MLModel.compileModel(at: mainModelPath)
 
-        // Load main model - .all lets CoreML pick optimal compute units
         let mainConfig = MLModelConfiguration()
-        mainConfig.computeUnits = .all
+        mainConfig.computeUnits = computeUnits ?? recommendedComputeUnits(for: config)
         let mainModel = try MLModel(contentsOf: compiledMainModelURL, configuration: mainConfig)
-        logger.info("Loaded main Sortformer model")
+        logger.info("Loaded main Sortformer model (computeUnits=\(mainConfig.computeUnits.rawValue))")
 
         let duration = Date().timeIntervalSince(startTime)
         logger.info("Models loaded in \(String(format: "%.2f", duration))s")
@@ -91,11 +92,38 @@ extension SortformerModels {
 
     /// Default MLModel configuration
     public static func defaultConfiguration() -> MLModelConfiguration {
-        let config = MLModelConfiguration()
-        config.allowLowPrecisionAccumulationOnGPU = true
         let isCI = ProcessInfo.processInfo.environment["CI"] != nil
-        config.computeUnits = isCI ? .cpuAndNeuralEngine : .all
-        return config
+        return MLModelConfigurationUtils.defaultConfiguration(computeUnits: isCI ? .cpuAndNeuralEngine : .all)
+    }
+
+    /// Memory (GiB) below which the large fp16 high-context head is loaded on CPU only.
+    /// A14-class devices ship ~4GB; iPhone 14 has 6GB. 8GB cleanly separates those from
+    /// Apple Silicon Macs / recent iPads that compile the ANE program without hanging.
+    private static let highContextAneRamThresholdGiB: Double = 8
+
+    /// Pick CoreML compute units for `config`, defaulting to `.all` but avoiding a known
+    /// load-time pathology: the ~2.4GB fp16 high-context head triggers a multi-minute ANE
+    /// program-compile hang on RAM-constrained devices (A14, ~4GB), which `.cpuOnly` avoids
+    /// (issue #726). The palettized high-context head (~330MB) loads fine on ANE, so it keeps
+    /// `.all`; only the large fp16 high-context variants on low-RAM devices fall back.
+    public static func recommendedComputeUnits(for config: SortformerConfig) -> MLComputeUnits {
+        let isLargeHighContext =
+            (config.modelVariant == .highContextV2 || config.modelVariant == .highContextV2_1)
+            && config.precision == .fp16
+        guard isLargeHighContext else { return .all }
+
+        let physicalGiB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        guard physicalGiB < highContextAneRamThresholdGiB else { return .all }
+
+        logger.warning(
+            """
+            Loading large fp16 \(config.modelVariant.map(String.init(describing:)) ?? "high-context") \
+            head on a \(String(format: "%.1f", physicalGiB))GB device with .cpuOnly to avoid the \
+            multi-minute ANE compile hang (issue #726). Use SortformerConfig.precision = .palettized \
+            for an ANE-friendly ~330MB build, or pass computeUnits explicitly to override.
+            """
+        )
+        return .cpuOnly
     }
 
     /// Load Sortformer models from HuggingFace.
@@ -104,12 +132,14 @@ extension SortformerModels {
     ///
     /// - Parameters:
     ///   - cacheDirectory: Directory to cache downloaded models (defaults to app support)
-    ///   - computeUnits: CoreML compute units to use (default: cpuOnly for consistency)
+    ///   - computeUnits: CoreML compute units. Pass `nil` (default) to auto-resolve via
+    ///     `recommendedComputeUnits(for:)` (issue #726).
     /// - Returns: Loaded SortformerModels
     public static func loadFromHuggingFace(
         config: SortformerConfig,
         cacheDirectory: URL? = nil,
-        computeUnits: MLComputeUnits = .all
+        computeUnits: MLComputeUnits? = nil,
+        progressHandler: ProgressHandler? = nil
     ) async throws -> SortformerModels {
         logger.info("Loading Sortformer models from HuggingFace...")
 
@@ -133,11 +163,15 @@ extension SortformerModels {
 
         // Download models if needed
 
-        let models = try await DownloadUtils.loadModels(
+        let resolvedComputeUnits = computeUnits ?? recommendedComputeUnits(for: config)
+
+        let models = try await ModelHub.loadModels(
             .sortformer,
             modelNames: [bundle],
             directory: directory,
-            computeUnits: computeUnits
+            computeUnits: resolvedComputeUnits,
+            variant: bundle,
+            progressHandler: progressHandler
         )
 
         guard let sortformer = models[bundle]
@@ -152,6 +186,52 @@ extension SortformerModels {
             config: config,
             main: sortformer,
             compilationDuration: duration
+        )
+    }
+}
+
+// MARK: - Embedded Configuration
+
+extension SortformerModels {
+
+    /// The model-shape-defining streaming parameters the converter embeds in the CoreML model
+    /// metadata. These determine the input tensor shapes and must match the host config.
+    ///
+    /// Note: `spkcache_update_period` is intentionally excluded — `SortformerConfig.init` clamps
+    /// it host-side (`max(min(period, fifoLen+chunkLen), chunkLen)`), so the host value legitimately
+    /// differs from the raw value baked into the model and is not a compatibility signal.
+    public struct EmbeddedConfig: Equatable, Sendable {
+        public let chunkLen: Int
+        public let chunkLeftContext: Int
+        public let chunkRightContext: Int
+        public let fifoLen: Int
+        public let spkcacheLen: Int
+    }
+
+    /// The variant-defining streaming parameters the converter writes into the CoreML model
+    /// metadata. Returns `nil` for older exports that don't carry them. Used to detect a
+    /// `SortformerConfig` that doesn't match the model — a mismatch yields incorrect and much
+    /// slower diarization (issue #726).
+    public var embeddedConfig: EmbeddedConfig? {
+        guard let meta = mainModel.modelDescription.metadata[.creatorDefinedKey] as? [String: String] else {
+            return nil
+        }
+        func value(_ key: String) -> Int? { meta[key].flatMap(Int.init) }
+        guard
+            let chunkLen = value("chunk_len"),
+            let chunkLeftContext = value("chunk_left_context"),
+            let chunkRightContext = value("chunk_right_context"),
+            let fifoLen = value("fifo_len"),
+            let spkcacheLen = value("spkcache_len")
+        else {
+            return nil
+        }
+        return EmbeddedConfig(
+            chunkLen: chunkLen,
+            chunkLeftContext: chunkLeftContext,
+            chunkRightContext: chunkRightContext,
+            fifoLen: fifoLen,
+            spkcacheLen: spkcacheLen
         )
     }
 }
@@ -235,13 +315,58 @@ extension SortformerModels {
         let output = try mainModel.prediction(from: inputFeatures)
 
         // Extract outputs (names must match CoreML Sortformer model)
-        guard let predictions = output.featureValue(for: "speaker_preds")?.shapedArrayValue(of: Float32.self)?.scalars,
-            let chunkEmbeddings = output.featureValue(for: "chunk_pre_encoder_embs")?.shapedArrayValue(
-                of: Float32.self)?.scalars,
-            let chunkEmbeddingsLength = output.featureValue(for: "chunk_pre_encoder_lengths")?.shapedArrayValue(
-                of: Int32.self)?.scalars.first
-        else {
-            throw SortformerError.inferenceFailed("Missing model outputs")
+        // Note: Output names use _out suffix to avoid macOS 26+ BNNS compiler error
+        // where input and output tensors cannot share the same name
+
+        // Chunk embeddings may be Float16 (head module uses fp16) or Float32
+        let chunkEmbeddings: [Float]
+        let predictions: [Float]
+        let chunkEmbeddingsLength: Int
+
+        // Get speaker probabilities
+        if let preds = output.featureValue(for: "speaker_preds_out")?.shapedArrayValue(of: Float32.self)?.scalars {
+            predictions = preds
+        } else if let preds = output.featureValue(for: "speaker_preds")?.shapedArrayValue(of: Float32.self)?.scalars {
+            predictions = preds
+        } else {
+            throw SortformerError.inferenceFailed("Missing speaker_preds or speaker_preds_out")
+        }
+
+        // Get chunk length
+        if let length = output.featureValue(for: "chunk_pre_encoder_lengths_out")?.shapedArrayValue(
+            of: Int32.self)?.scalars.first
+        {
+            chunkEmbeddingsLength = Int(length)
+        } else if let length = output.featureValue(for: "chunk_pre_encoder_lengths")?.shapedArrayValue(
+            of: Int32.self)?.scalars.first
+        {
+            chunkEmbeddingsLength = Int(length)
+        } else {
+            throw SortformerError.inferenceFailed("Missing chunk_pre_encoder_lengths or chunk_pre_encoder_lengths_out")
+        }
+
+        // Get acoustic embeddings
+        if let fp32 = output.featureValue(for: "chunk_pre_encoder_embs_out")?.shapedArrayValue(of: Float32.self)?
+            .scalars
+        {
+            chunkEmbeddings = fp32
+        } else if let fp32 = output.featureValue(for: "chunk_pre_encoder_embs")?.shapedArrayValue(of: Float32.self)?
+            .scalars
+        {
+            chunkEmbeddings = fp32
+        } else {
+            #if arch(arm64)
+            if #available(macOS 15.0, iOS 18.0, *),
+                let fp16 = output.featureValue(for: "chunk_pre_encoder_embs_out")?.shapedArrayValue(of: Float16.self)?
+                    .scalars
+            {
+                chunkEmbeddings = fp16.map { Float($0) }
+            } else {
+                throw SortformerError.inferenceFailed("Missing chunk_pre_encoder_embs_out")
+            }
+            #else
+            throw SortformerError.inferenceFailed("Missing chunk_pre_encoder_embs_out")
+            #endif
         }
 
         return MainModelOutput(

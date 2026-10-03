@@ -27,6 +27,7 @@ struct VBxClustering {
     private let config: OfflineDiarizerConfig
     private let pldaTransform: PLDATransform
     private let logger = AppLogger(category: "OfflineVBx")
+    private static let constraintLogger = AppLogger(category: "OfflineVBx")
     private let signposter = OSSignposter(
         subsystem: "com.fluidaudio.diarization",
         category: .pointsOfInterest
@@ -688,26 +689,77 @@ struct VBxClustering {
         initialClusters: [Int],
         constraints: SpeakerCountConstraints?
     ) -> VBxOutput {
-        var output = refine(rhoFeatures: rhoFeatures, initialClusters: initialClusters)
+        let output = refine(rhoFeatures: rhoFeatures, initialClusters: initialClusters)
 
+        return Self.applyConstraints(
+            to: output,
+            trainingEmbeddings: trainingEmbeddings,
+            constraints: constraints
+        )
+    }
+
+    /// Re-clusters a VBx output to satisfy speaker count constraints.
+    ///
+    /// Split out of `refineWithConstraints` and made static so the constraint
+    /// decision can be exercised without PLDA models: everything below the VBx
+    /// refinement itself is pure arithmetic over the output.
+    ///
+    /// - Parameters:
+    ///   - output: The VBx refinement to check.
+    ///   - trainingEmbeddings: Original embeddings for K-Means re-clustering.
+    ///   - constraints: Speaker count constraints; `nil` leaves `output` untouched.
+    /// - Returns: `output`, or a K-Means re-clustering of it at the target count.
+    static func applyConstraints(
+        to output: VBxOutput,
+        trainingEmbeddings: [[Double]],
+        constraints: SpeakerCountConstraints?
+    ) -> VBxOutput {
         guard let constraints = constraints else {
             return output
         }
 
-        let detectedCount = output.numClusters
+        // Both censuses have to fit the bounds, because both are visible
+        // downstream, and neither is the AHC warm-start count (gating on that
+        // re-clusters even when VBx already agrees, #801).
+        //
+        // The argmax census is the count embeddings actually land in: a cluster
+        // can keep trace mixture weight while winning no embedding's argmax, so
+        // gating on the pi census alone silently ignores a numSpeakers request
+        // that matches it while the caller sees fewer speakers (#802).
+        //
+        // The pi census still has to fit too. Centroid construction covers every
+        // cluster with pi > epsilon — pyannote parity, so constrained assignment
+        // can place a speaker sharing a chunk onto a cluster that won no argmax.
+        // That revives a cluster this check had excluded, and the result exceeds
+        // numSpeakers/maxSpeakers with no adjustment having run.
+        //
+        // The argmax census leads when both are out of bounds: it is what #802
+        // tuned the adjustment around, so an under-count still re-clusters to
+        // the same target as before. The pi census only decides cases the argmax
+        // census called satisfied.
+        let assignedCount = output.assignedClusterCount
+        let activeCount = output.activeClusterCount
+        let detectedCount =
+            constraints.needsAdjustment(detectedCount: assignedCount)
+            ? assignedCount
+            : activeCount
         guard constraints.needsAdjustment(detectedCount: detectedCount) else {
             return output
         }
 
         let targetCount = constraints.targetCount(detectedCount: detectedCount)
-        logger.info(
+        constraintLogger.info(
             "Speaker count \(detectedCount) outside bounds [\(constraints.minSpeakers), \(constraints.maxSpeakers)]; re-clustering to \(targetCount)"
         )
 
-        let (kmeansClusters, centroids) = KMeansClustering.clusterWithCentroids(
+        // n_init=10 の決定的初期化から最小 inertia を採用(sklearn 流)。単一ランダム初期化は
+        // 脆い話者を非決定的に collapse させる(ICT 小牧で実証、~10%↔~30% の揺れ)。
+        let (kmeansClusters, centroids) = KMeansClustering.clusterWithCentroidsNInit(
             embeddings: trainingEmbeddings,
             numClusters: targetCount,
-            maxIterations: 100
+            maxIterations: 100,
+            nInit: 10,
+            baseSeed: 0
         )
 
         return VBxOutput(

@@ -11,7 +11,7 @@ import os
 /// - Uses `AVAudioConverter` for all sample-rate, sample-format, and channel-count conversions.
 /// - Avoids any manual resampling; only raw sample extraction occurs after conversion.
 /// - Creates a new converter for each operation (stateless).
-final public class AudioConverter {
+final public class AudioConverter: Sendable {
     private let logger = AppLogger(category: "AudioConverter")
     private let targetFormat: AVAudioFormat
     private let debug: Bool
@@ -34,6 +34,20 @@ final public class AudioConverter {
                 interleaved: false
             )!
         }
+    }
+
+    /// Public initializer so external modules (e.g. CLI) can construct the converter
+    /// - Parameters:
+    ///   - sampleRate: Target audio sample rate
+    ///   - debug: Whether to log debug messages
+    public init(sampleRate: Double, debug: Bool = false) {
+        self.debug = debug
+        self.targetFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: sampleRate,
+            channels: 1,
+            interleaved: false
+        )!
     }
 
     // MARK: - Public Resampling Methods
@@ -77,14 +91,40 @@ final public class AudioConverter {
     public func resampleAudioFile(_ url: URL) throws -> [Float] {
         let audioFile = try AVAudioFile(forReading: url)
         let format = audioFile.processingFormat
-        let frameCount = AVAudioFrameCount(audioFile.length)
+        let chunkSize = max(4096, Int(format.sampleRate))
+        var monoSamples: [Float] = []
+        monoSamples.reserveCapacity(Int(audioFile.length))
 
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
-            throw AudioConverterError.failedToCreateBuffer
+        while audioFile.framePosition < audioFile.length {
+            let remaining = Int(audioFile.length - audioFile.framePosition)
+            let framesToRead = AVAudioFrameCount(min(chunkSize, remaining))
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: framesToRead) else {
+                throw AudioConverterError.failedToCreateBuffer
+            }
+            do {
+                try audioFile.read(into: buffer)
+            } catch {
+                // AVAudioFile.length is an ESTIMATE for packetized formats
+                // (MP3/AAC): encoder delay/padding accounting can overshoot the
+                // decodable stream by a few hundred frames, and reading the
+                // phantom tail throws a contract-breaking nilError
+                // (Foundation._GenericObjCError 0) instead of returning an
+                // empty buffer. Everything decodable is already in hand —
+                // treat a failed read after real audio as EOF rather than
+                // failing the whole file. A throw on the FIRST read is a
+                // genuinely unreadable file and still propagates.
+                if monoSamples.isEmpty {
+                    throw error
+                }
+                break
+            }
+            if buffer.frameLength == 0 {
+                break
+            }
+            monoSamples.append(contentsOf: try extractMonoFloat32(from: buffer))
         }
 
-        try audioFile.read(into: buffer)
-        return try resampleBuffer(buffer)
+        return try resample(monoSamples, from: format.sampleRate)
     }
 
     /// Convert an audio file path to target sample rate mono Float32 samples.
@@ -169,7 +209,7 @@ final public class AudioConverter {
             throw AudioConverterError.failedToCreateSourceFormat
         }
 
-        // Use AVAudioConverter for channel mixing and format conversion
+        // Use AVAudioConverter for channel mixing (same sample rate, no resampling needed)
         guard let converter = AVAudioConverter(from: format, to: monoFormat) else {
             throw AudioConverterError.failedToCreateConverter
         }
@@ -178,13 +218,16 @@ final public class AudioConverter {
             throw AudioConverterError.failedToCreateBuffer
         }
 
-        nonisolated(unsafe) var provided = false
-        nonisolated(unsafe) let capturedBuffer = buffer
+        let provided = OSAllocatedUnfairLock(initialState: false)
         let inputBlock: AVAudioConverterInputBlock = { _, status in
-            if !provided {
-                provided = true
+            let wasProvided = provided.withLock { state -> Bool in
+                if state { return true }
+                state = true
+                return false
+            }
+            if !wasProvided {
                 status.pointee = .haveData
-                return capturedBuffer
+                return buffer
             } else {
                 status.pointee = .endOfStream
                 return nil
@@ -264,6 +307,7 @@ final public class AudioConverter {
         guard let converter = AVAudioConverter(from: inputFormat, to: format) else {
             throw AudioConverterError.failedToCreateConverter
         }
+        configure(converter: converter)
 
         // Estimate first pass capacity and allocate
         let sampleRateRatio = format.sampleRate / inputFormat.sampleRate
@@ -279,21 +323,18 @@ final public class AudioConverter {
         var aggregated: [Float] = []
         aggregated.reserveCapacity(Int(estimatedOutputFrames))
 
-        // Provide input once, then signal end-of-stream
+        // AVAudioConverter consumes this input block synchronously within convert(...),
+        // but Swift 6 rejects mutation of captured vars in this callback.
         let provided = OSAllocatedUnfairLock(initialState: false)
-        // Buffer is only accessed synchronously by AVAudioConverter's input block callback
-        nonisolated(unsafe) let capturedBuffer = buffer
         let inputBlock: AVAudioConverterInputBlock = { _, status in
             let wasProvided = provided.withLock { state -> Bool in
-                if state {
-                    return true
-                }
+                if state { return true }
                 state = true
                 return false
             }
             if !wasProvided {
                 status.pointee = .haveData
-                return capturedBuffer
+                return buffer
             } else {
                 status.pointee = .endOfStream
                 return nil
@@ -326,6 +367,11 @@ final public class AudioConverter {
         }
 
         return aggregated
+    }
+
+    private func configure(converter: AVAudioConverter) {
+        converter.sampleRateConverterAlgorithm = AVSampleRateConverterAlgorithm_Mastering
+        converter.sampleRateConverterQuality = AVAudioQuality.max.rawValue
     }
 
     /// Check if a format already matches the target output format.
@@ -427,10 +473,18 @@ final public class AudioConverter {
 // MARK: - WAV Utilities (shared by TTS/ASR)
 public enum AudioWAV {
     /// Convert float samples to 16-bit PCM mono WAV at the given sample rate.
-    public static func data(from samples: [Float], sampleRate: Double) throws -> Data {
-        // Normalize to [-1, 1]
+    ///
+    /// - Parameter normalize: when `true` (default) the samples are peak-scaled
+    ///   to ±1.0 before quantization (consistent loudness). Pass `false` to
+    ///   write the samples at their native level — used by backends whose
+    ///   model output is already correctly leveled (e.g. KokoroAne, which
+    ///   matches the PyTorch reference level) so the output isn't slammed to
+    ///   0 dBFS. Out-of-range samples are still clamped to [-1, 1].
+    public static func data(
+        from samples: [Float], sampleRate: Double, normalize: Bool = true
+    ) throws -> Data {
         let maxVal = samples.map { abs($0) }.max() ?? 1.0
-        let norm = maxVal > 0 ? samples.map { $0 / maxVal } : samples
+        let norm = (normalize && maxVal > 0) ? samples.map { $0 / maxVal } : samples
 
         // Convert to 16-bit PCM
         var pcm = Data()

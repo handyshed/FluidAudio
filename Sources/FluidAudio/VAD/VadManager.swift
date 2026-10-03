@@ -76,13 +76,16 @@ public actor VadManager {
     }
 
     /// Initialize with configuration
-    public init(config: VadConfig = .default) async throws {
+    public init(
+        config: VadConfig = .default,
+        progressHandler: ProgressHandler? = nil
+    ) async throws {
         self.config = config
 
         let startTime = Date()
 
         // Load the unified model
-        try await loadUnifiedModel()
+        try await loadUnifiedModel(progressHandler: progressHandler)
 
         let totalInitTime = Date().timeIntervalSince(startTime)
         logger.info("VAD system initialized in \(String(format: "%.2f", totalInitTime))s")
@@ -104,25 +107,33 @@ public actor VadManager {
     }
 
     /// Initialize from directory
-    public init(config: VadConfig = .default, modelDirectory: URL) async throws {
+    public init(
+        config: VadConfig = .default,
+        modelDirectory: URL,
+        progressHandler: ProgressHandler? = nil
+    ) async throws {
         self.config = config
 
         let startTime = Date()
-        try await loadUnifiedModel(from: modelDirectory)
+        try await loadUnifiedModel(from: modelDirectory, progressHandler: progressHandler)
 
         let totalInitTime = Date().timeIntervalSince(startTime)
         logger.info("VAD system initialized in \(String(format: "%.2f", totalInitTime))s")
     }
 
-    private func loadUnifiedModel(from directory: URL? = nil) async throws {
+    private func loadUnifiedModel(
+        from directory: URL? = nil,
+        progressHandler: ProgressHandler? = nil
+    ) async throws {
         let baseDirectory = directory ?? getDefaultBaseDirectory()
 
-        // Use DownloadUtils to load the model (handles downloading if needed)
-        let models = try await DownloadUtils.loadModels(
+        // Use ModelHub to load the model (handles downloading if needed)
+        let models = try await ModelHub.loadModels(
             .vad,
             modelNames: Array(ModelNames.VAD.requiredModels),
             directory: baseDirectory.appendingPathComponent("Models"),
-            computeUnits: config.computeUnits
+            computeUnits: config.computeUnits,
+            progressHandler: progressHandler
         )
 
         // Get the VAD model

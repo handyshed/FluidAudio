@@ -1,5 +1,6 @@
 // swift-tools-version: 6.0
 import PackageDescription
+import Foundation
 
 let package = Package(
     name: "FluidAudio",
@@ -11,10 +12,6 @@ let package = Package(
         .library(
             name: "FluidAudio",
             targets: ["FluidAudio"]
-        ),
-        .library(
-            name: "FluidAudioTTS",
-            targets: ["FluidAudioTTS"]
         ),
         .executable(
             name: "fluidaudiocli",
@@ -28,13 +25,25 @@ let package = Package(
             dependencies: [
                 "FastClusterWrapper",
                 "MachTaskSelfWrapper",
+                "NemoTextProcessing",
             ],
             path: "Sources/FluidAudio",
-            exclude: [
-                "Frameworks",
-                "ASR/ContextBiasing",
-                "ASR/CtcModels.swift",
+            exclude: ["ASR/Parakeet/Unified/benchmark.md"],
+            resources: [
+                // Keep .process: .copy of a Resources-named directory breaks Apple code signing on iOS.
+                .process("TTS/LuxTts/G2p/Resources")
             ]
+        ),
+        // Byte-exact NeMo text normalization (FST engine, all 7 languages).
+        // Prebuilt xcframework from FluidInference/text-processing-rs v0.3.1
+        // (macOS, iOS, iOS Simulator and Mac Catalyst slices).
+        // Always linked on tools < 6.2; Package@swift-6.2.swift exposes it as
+        // the opt-out `NemoTextProcessing` trait (#880, #888).
+        .binaryTarget(
+            name: "NemoTextProcessing",
+            url:
+                "https://github.com/FluidInference/text-processing-rs/releases/download/v0.3.1/NemoTextProcessing.xcframework.zip",
+            checksum: "5fa8c10d4ec26c1bb2413125f351a7222a4c68a23b74476680fbada7e26fc6aa"
         ),
         .target(
             name: "FastClusterWrapper",
@@ -46,25 +55,9 @@ let package = Package(
             path: "Sources/MachTaskSelfWrapper",
             publicHeadersPath: "include"
         ),
-        // TTS targets are always available for FluidAudioWithTTS product
-        .binaryTarget(
-            name: "ESpeakNG",
-            path: "Frameworks/ESpeakNG.xcframework"
-        ),
-        .target(
-            name: "FluidAudioTTS",
-            dependencies: [
-                "FluidAudio",
-                "ESpeakNG",
-            ],
-            path: "Sources/FluidAudioTTS"
-        ),
         .executableTarget(
             name: "FluidAudioCLI",
-            dependencies: [
-                "FluidAudio",
-                "FluidAudioTTS",
-            ],
+            dependencies: ["FluidAudio"],
             path: "Sources/FluidAudioCLI",
             exclude: ["README.md"],
             resources: [
@@ -75,7 +68,14 @@ let package = Package(
             name: "FluidAudioTests",
             dependencies: [
                 "FluidAudio",
-                "FluidAudioTTS",
+                "FluidAudioCLI",
+            ],
+            resources: [
+                .process("TTS/LuxTts/Resources"),
+                .process("TTS/PocketTTS/Fixtures"),
+                // Real recordings (cleared for public release by the speaker) for the
+                // streaming final-window regression, issue #855.
+                .copy("ASR/Parakeet/SlidingWindow/Fixtures"),
             ]
         ),
     ],

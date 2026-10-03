@@ -19,7 +19,7 @@ public final class DiarizerManager {
     private let memoryOptimizer = ANEMemoryOptimizer()
 
     // Speaker manager for consistent speaker tracking
-    public let speakerManager: SpeakerManager
+    public var speakerManager: SpeakerManager
 
     public init(config: DiarizerConfig = .default) {
         self.config = config
@@ -75,6 +75,49 @@ public final class DiarizerManager {
         speakerManager.initializeKnownSpeakers(speakers)
     }
 
+    /// Extract a 256-dimensional speaker embedding from audio samples.
+    ///
+    /// Use this to build a `Speaker` for `initializeKnownSpeakers()` from a recording
+    /// of a single known speaker.
+    ///
+    /// ```swift
+    /// let embedding = try diarizer.extractSpeakerEmbedding(from: aliceSamples)
+    /// let alice = Speaker(id: "alice", name: "Alice", currentEmbedding: embedding, isPermanent: true)
+    /// diarizer.initializeKnownSpeakers([alice])
+    /// ```
+    ///
+    /// - Parameter audio: Audio samples (16kHz mono) of a single speaker
+    /// - Returns: L2-normalized 256-dimensional embedding
+    /// - Throws: `DiarizerError.notInitialized` if models not loaded
+    public func extractSpeakerEmbedding<C>(from audio: C) throws -> [Float]
+    where C: RandomAccessCollection, C.Element == Float, C.Index == Int {
+        guard let extractor = embeddingExtractor, let models else {
+            throw DiarizerError.notInitialized
+        }
+
+        // Determine the segmentation frame count from the model's output shape.
+        // The pyannote segmentation model outputs [1, numFrames, 7] — we need
+        // numFrames to size the mask correctly for the WeSpeaker embedding model.
+        guard
+            let segShape = models.segmentationModel.modelDescription
+                .outputDescriptionsByName["segments"]?.multiArrayConstraint?.shape,
+            segShape.count >= 2
+        else {
+            throw DiarizerError.processingFailed(
+                "Cannot determine segmentation frame count from model output shape"
+            )
+        }
+        let numFrames = segShape[1].intValue
+
+        // All-ones mask: assume the entire clip is the target speaker
+        let mask = [Float](repeating: 1.0, count: numFrames)
+        let embeddings = try extractor.getEmbeddings(audio: audio, masks: [mask])
+        guard let embedding = embeddings.first else {
+            throw DiarizerError.embeddingExtractionFailed
+        }
+        return embedding
+    }
+
     /// Perform complete speaker diarization on audio samples.
     ///
     /// Processes the entire audio to identify "who spoke when" by:
@@ -87,6 +130,9 @@ public final class DiarizerManager {
     ///   - samples: Audio samples (16kHz mono) - accepts any RandomAccessCollection of Float
     ///             (Array, ArraySlice, ContiguousArray, or custom collections)
     ///   - sampleRate: Sample rate (default: 16000)
+    ///   - progressHandler: Optional callback invoked after each processed audio chunk with
+    ///             overall progress in the range `0.0...1.0`. Called synchronously on the
+    ///             calling thread; the final call reports `1.0` once processing completes.
     /// - Returns: `DiarizationResult` containing:
     ///   - `segments`: Array of speaker segments with speaker IDs, timestamps, and embeddings
     ///   - `speakerDatabase`: Dictionary mapping speaker IDs to embeddings (only when debugMode enabled)
@@ -108,7 +154,8 @@ public final class DiarizerManager {
     /// let result = try diarizer.performCompleteDiarization(audioContiguous)
     /// ```
     public func performCompleteDiarization<C>(
-        _ samples: C, sampleRate: Int = 16000, atTime startTime: TimeInterval = 0
+        _ samples: C, sampleRate: Int = 16000, atTime startTime: TimeInterval = 0,
+        progressHandler: ((Double) -> Void)? = nil
     ) throws -> DiarizationResult
     where C: RandomAccessCollection, C.Element == Float, C.Index == Int {
         guard let models else {
@@ -153,7 +200,11 @@ public final class DiarizerManager {
             segmentationTime += chunkTimings.segmentationTime
             embeddingTime += chunkTimings.embeddingTime
             clusteringTime += chunkTimings.clusteringTime
+
+            progressHandler?(
+                Double(min(chunkStartOffset + stepSize, totalSamples)) / Double(totalSamples))
         }
+        progressHandler?(1.0)
 
         let postProcessingStartTime = Date()
         let filteredSegments = allSegments  // No post-processing
@@ -170,7 +221,8 @@ public final class DiarizerManager {
             )
 
             // Build speakerDatabase from speakerManager for debug output
-            let speakerDB = speakerManager.getAllSpeakers().reduce(into: [String: [Float]]()) { result, item in
+            let speakerDB = speakerManager.getAllSpeakers().reduce(into: [String: [Float]]()) {
+                result, item in
                 result[item.key] = item.value.currentEmbedding
             }
 

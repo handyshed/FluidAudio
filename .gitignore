@@ -11,6 +11,7 @@ xcuserdata/
 *.hmap
 
 *.txt
+!Benchmarks/**/*.txt
 
 ## App packaging
 *.ipa
@@ -90,6 +91,8 @@ baseline*.json
 .vscode/
 
 *results.json
+*benchmark*.json
+.sortformer_progress*.json
 
 
 FluidAudioDatasets/
@@ -99,9 +102,21 @@ FluidAudioDatasets/
 Resources/
 !Sources/FluidAudio/Resources/
 !Sources/FluidAudio/Resources/**
-!Sources/FluidAudio/Frameworks/ESpeakNG.xcframework/**/Resources/
-!Sources/FluidAudio/Frameworks/ESpeakNG.xcframework/**/Resources/**
+# LuxTts parity fixtures (dump_swift_fixtures.py); the reference wav
+# stays untracked per the repo-wide *.wav rule (tests read JSON stats).
+!Tests/FluidAudioTests/TTS/LuxTts/Resources/
+!Tests/FluidAudioTests/TTS/LuxTts/Resources/**
+Tests/FluidAudioTests/TTS/LuxTts/Resources/*.wav
+# LuxTts bundled G2P lexicon (probe_lexicon.py in mobius zipvoice)
+!Sources/FluidAudio/TTS/LuxTts/G2p/Resources/
+!Sources/FluidAudio/TTS/LuxTts/G2p/Resources/**
 scripts/
+!Scripts/parakeet_subset_benchmark.sh
+!Scripts/diarizer_subset_benchmark.sh
+
+# MiniMax TTS corpus is CC-BY-SA-4.0 derivative content fetched on demand
+# via `fluidaudio minimax-corpus`; only the README is checked in.
+Benchmarks/tts/corpus/minimax/*.txt
 Documentation/parakeet-tdt/
 docs/parakeet-tdt/
 
@@ -109,3 +124,12 @@ fluidaudio_cli/*
 .vscode/
 
 .mobius/
+
+# Continuous Claude cache (local only)
+.claude/cache/
+
+# Supertonic-3 local model-conversion artifacts (research-only;
+# scripts + trials live in mobius repo, see models/tts/supertonic_3/).
+.venv-supertonic3/
+build/supertonic-3-coreml/
+.build-*/

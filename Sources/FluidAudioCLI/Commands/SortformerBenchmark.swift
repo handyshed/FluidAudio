@@ -1,36 +1,17 @@
 #if os(macOS)
-import AVFoundation
 import FluidAudio
 import Foundation
 
 /// Sortformer streaming diarization benchmark for evaluating real-time performance
 enum SortformerBenchmark {
     private static let logger = AppLogger(category: "SortformerBench")
+    private static let derFrameStepSeconds: Double = 0.01
 
-    enum Dataset: String {
-        case ami = "ami"
-        case voxconverse = "voxconverse"
-        case callhome = "callhome"
-    }
-
-    struct BenchmarkResult {
-        let meetingName: String
-        let der: Float
-        let missRate: Float
-        let falseAlarmRate: Float
-        let speakerErrorRate: Float
-        let rtfx: Float
-        let processingTime: Double
-        let totalFrames: Int
-        let detectedSpeakers: Int
-        let groundTruthSpeakers: Int
-        let modelLoadTime: Double
-        let audioLoadTime: Double
-    }
+    typealias Dataset = DiarizationBenchmarkUtils.Dataset
+    typealias BenchmarkResult = DiarizationBenchmarkUtils.BenchmarkResult
 
     static func printUsage() {
-        print(
-            """
+        let usage = """
             Sortformer Benchmark Command
 
             Evaluates Sortformer streaming speaker diarization on various corpora.
@@ -38,24 +19,29 @@ enum SortformerBenchmark {
             Usage: fluidaudio sortformer-benchmark [options]
 
             Options:
-                --dataset <name>         Dataset to use: ami, voxconverse, callhome (default: ami)
-                --single-file <name>     Process a specific meeting (e.g., ES2004a)
-                --max-files <n>          Maximum number of files to process
-                --threshold <value>      Speaker activity threshold (default: 0.5)
-                --preprocessor <path>    Path to SortformerPreprocessor.mlpackage
-                --model <path>           Path to Sortformer.mlpackage
-                --nvidia-low-latency     Use NVIDIA 1.04s latency config (20.57% DER target)
-                --nvidia-high-latency            Use NVIDIA 30.4s latency config (20.57% DER target)
-                --gradient-descent       Use Gradient Descent config (downloads from HuggingFace by default)
-                --hf                     Download models from HuggingFace (clears cache first)
-                --local                  Use local models instead of HuggingFace (for --gradient-descent)
-                --output <file>          Output JSON file for results
-                --progress <file>        Progress file for resuming (default: .sortformer_progress.json)
-                --resume                 Resume from previous progress file
-                --verbose                Enable verbose output
-                --debug                  Enable debug mode
-                --auto-download          Auto-download AMI dataset if missing
-                --help                   Show this help message
+                --dataset <name>            Dataset to use: ami, voxconverse, callhome (default: ami)
+                --single-file <name>        Process a specific meeting (e.g., ES2004a)
+                --max-files <n>             Maximum number of files to process
+                --threshold <value>         Speaker activity threshold (default: 0.5)
+                --silence-threshold <0-1>   Silence detection threshold (default: 0.2)
+                --scores-boost-latest <fl>  Boost factor for latest frames (default: 0.05)
+                --strong-boost-rate <0-1>   Strong boost rate (default: 0.75)
+                --weak-boost-rate <fl>      Weak boost rate (default: 1.5)
+                --min-pos-scores-rate <0-1> Minimum positive scores rate (default: 0.5)
+                --spkcache-sil-frames <n>   Silence frames per speaker in cache (default: 3)
+                --model <path>              Path to Sortformer.mlpackage
+                --nvidia-low-latency        Use NVIDIA 1.04s latency config
+                --nvidia-high-latency       Use NVIDIA 30.4s latency config
+                --gradient-descent          Use Gradient Descent config (default)
+                --hf                        Use HuggingFace/cache-backed model loading
+                --local                     Use local mlpackage loading
+                --output <file>             Output JSON file for results
+                --progress <file>           Progress file for resuming (default: .sortformer_progress.json)
+                --resume                    Resume from previous progress file
+                --verbose                   Enable verbose output
+                --debug                     Enable debug mode
+                --auto-download             Auto-download AMI dataset if missing
+                --help                      Show this help message
 
             Performance Targets:
                 DER ~11%   (NVIDIA benchmark on DI-HARD III)
@@ -72,7 +58,9 @@ enum SortformerBenchmark {
                 fluidaudio sortformer-benchmark --single-file ES2004a \\
                     --preprocessor ./models/SortformerPreprocessor.mlpackage \\
                     --model ./models/Sortformer.mlpackage
-            """)
+            """
+        fputs(usage, stderr)
+        fflush(stderr)
     }
 
     static func run(arguments: [String]) async {
@@ -80,6 +68,9 @@ enum SortformerBenchmark {
         var singleFile: String?
         var maxFiles: Int?
         var threshold: Float = 0.5
+        var collarSeconds: Double = 0
+        var onsetThreshold: Float?
+        var offsetThreshold: Float?
         var modelPath: String?
         var outputFile: String?
         var verbose = false
@@ -87,12 +78,21 @@ enum SortformerBenchmark {
         var autoDownload = false
         var useNvidiaLowLatency = false
         var useNvidiaHighLatency = false
-        var useGradientDescent = false
-        var useHuggingFace = false
+        var useHuggingFace = true
         var useLocalModels = false
+        var offline = false
+        var palettized = false
         var progressFile: String = ".sortformer_progress.json"
         var resumeFromProgress = false
         var dataset: Dataset = .ami
+
+        // SortformerConfig tuning fields
+        var silenceThreshold: Float?
+        var scoresBoostLatest: Float?
+        var strongBoostRate: Float?
+        var weakBoostRate: Float?
+        var minPosScoresRate: Float?
+        var spkcacheSilFramesPerSpk: Int?
 
         var i = 0
         while i < arguments.count {
@@ -102,7 +102,7 @@ enum SortformerBenchmark {
                     if let d = Dataset(rawValue: arguments[i + 1].lowercased()) {
                         dataset = d
                     } else {
-                        print("⚠️ Unknown dataset: \(arguments[i + 1]). Using ami.")
+                        print("Unknown dataset: \(arguments[i + 1]). Using ami.")
                     }
                     i += 1
                 }
@@ -119,6 +119,21 @@ enum SortformerBenchmark {
             case "--threshold":
                 if i + 1 < arguments.count {
                     threshold = Float(arguments[i + 1]) ?? 0.5
+                    i += 1
+                }
+            case "--collar":
+                if i + 1 < arguments.count {
+                    collarSeconds = Double(arguments[i + 1]) ?? 0
+                    i += 1
+                }
+            case "--onset":
+                if i + 1 < arguments.count {
+                    onsetThreshold = Float(arguments[i + 1])
+                    i += 1
+                }
+            case "--offset":
+                if i + 1 < arguments.count {
+                    offsetThreshold = Float(arguments[i + 1])
                     i += 1
                 }
             case "--model":
@@ -149,28 +164,62 @@ enum SortformerBenchmark {
             case "--nvidia-low-latency":
                 useNvidiaLowLatency = true
             case "--gradient-descent":
-                useGradientDescent = true
+                // gradient-descent uses the default SortformerConfig which is already selected
+                break
+            case "--silence-threshold":
+                if i + 1 < arguments.count {
+                    silenceThreshold = Float(arguments[i + 1])
+                    i += 1
+                }
+            case "--scores-boost-latest":
+                if i + 1 < arguments.count {
+                    scoresBoostLatest = Float(arguments[i + 1])
+                    i += 1
+                }
+            case "--strong-boost-rate":
+                if i + 1 < arguments.count {
+                    strongBoostRate = Float(arguments[i + 1])
+                    i += 1
+                }
+            case "--weak-boost-rate":
+                if i + 1 < arguments.count {
+                    weakBoostRate = Float(arguments[i + 1])
+                    i += 1
+                }
+            case "--min-pos-scores-rate":
+                if i + 1 < arguments.count {
+                    minPosScoresRate = Float(arguments[i + 1])
+                    i += 1
+                }
+            case "--spkcache-sil-frames":
+                if i + 1 < arguments.count {
+                    spkcacheSilFramesPerSpk = Int(arguments[i + 1])
+                    i += 1
+                }
             case "--hf":
                 useHuggingFace = true
             case "--local":
                 useLocalModels = true
+            case "--offline":
+                offline = true
+            case "--palettized":
+                palettized = true
             case "--help":
                 printUsage()
                 return
             default:
-                if !arguments[i].starts(with: "--") {
-                    logger.warning("Unknown argument: \(arguments[i])")
-                }
+                logger.warning("Unknown argument: \(arguments[i])")
             }
             i += 1
         }
 
-        // Gradient descent uses HuggingFace by default unless --local is specified
-        if useGradientDescent && !useLocalModels {
-            useHuggingFace = true
+        // Benchmarks should prefer the cache-backed Hugging Face loader by default.
+        // `--local` explicitly opts out to local mlpackage loading.
+        if useLocalModels {
+            useHuggingFace = false
         }
 
-        print("🚀 Starting Sortformer Benchmark")
+        print("Starting Sortformer Benchmark")
         fflush(stdout)
         print("   Dataset: \(dataset.rawValue)")
         print("   Threshold: \(threshold)")
@@ -181,7 +230,8 @@ enum SortformerBenchmark {
 
         let modeDesc =
             useHuggingFace
-            ? "HuggingFace models" : "Combined Pipeline"
+            ? "HuggingFace/cache-backed models"
+            : "Local mlpackage"
         print("   Mode: \(modeDesc)")
         print("   Preprocessing: Native Swift mel spectrogram")
 
@@ -201,15 +251,9 @@ enum SortformerBenchmark {
 
         print("   Pipeline: \(pipelineURL.path)")
 
-        // Check models exist
-        guard useHuggingFace || FileManager.default.fileExists(atPath: pipelineURL.path) else {
-            print("ERROR: Pipeline model not found: \(pipelineURL.path)")
-            return
-        }
-
         // Download dataset if needed
         if autoDownload && dataset == .ami {
-            print("📥 Downloading AMI dataset if needed...")
+            print("Downloading AMI dataset if needed...")
             await DatasetDownloader.downloadAMIDataset(
                 variant: .sdm,
                 force: false,
@@ -223,23 +267,16 @@ enum SortformerBenchmark {
         if let meeting = singleFile {
             filesToProcess = [meeting]
         } else {
-            switch dataset {
-            case .ami:
-                filesToProcess = getAMIFiles(maxFiles: maxFiles)
-            case .voxconverse:
-                filesToProcess = getVoxConverseFiles(maxFiles: maxFiles)
-            case .callhome:
-                filesToProcess = getCALLHOMEFiles(maxFiles: maxFiles)
-            }
+            filesToProcess = DiarizationBenchmarkUtils.getFiles(for: dataset, maxFiles: maxFiles)
         }
 
         if filesToProcess.isEmpty {
-            print("❌ No files found to process")
+            print("No files found to process")
             fflush(stdout)
             return
         }
 
-        print("📂 Processing \(filesToProcess.count) file(s)")
+        print("Processing \(filesToProcess.count) file(s)")
         print("   Progress file: \(progressFile)")
         fflush(stdout)
 
@@ -247,59 +284,92 @@ enum SortformerBenchmark {
         var completedResults: [BenchmarkResult] = []
         var completedMeetings: Set<String> = []
         if resumeFromProgress {
-            if let loaded = loadProgress(from: progressFile) {
+            if let loaded = DiarizationBenchmarkUtils.loadProgress(from: progressFile) {
                 completedResults = loaded
                 completedMeetings = Set(loaded.map { $0.meetingName })
-                print("📥 Resuming: loaded \(completedResults.count) previous results")
+                print("Resuming: loaded \(completedResults.count) previous results")
                 for result in completedResults {
-                    print("   ✅ \(result.meetingName): \(String(format: "%.1f", result.der))% DER")
+                    print("   \(result.meetingName): \(String(format: "%.1f", result.der))% DER")
                 }
             } else {
-                print("📥 No previous progress found, starting fresh")
+                print("No previous progress found, starting fresh")
             }
         }
         print("")
         fflush(stdout)
 
+        // Offline (whole-file fused model) path — no streaming state, one fused call per window.
+        if offline {
+            await runOfflineBenchmark(
+                filesToProcess: filesToProcess,
+                completedResults: completedResults,
+                completedMeetings: completedMeetings,
+                dataset: dataset,
+                palettized: palettized,
+                modelPath: modelPath,
+                useHuggingFace: useHuggingFace,
+                threshold: threshold,
+                collarSeconds: collarSeconds,
+                verbose: verbose,
+                progressFile: progressFile,
+                outputFile: outputFile)
+            return
+        }
+
         // Initialize Sortformer
-        print("🔧 Loading Sortformer models...")
+        print("Loading Sortformer models...")
         fflush(stdout)
         let modelLoadStart = Date()
         var config: SortformerConfig
         if useNvidiaHighLatency {
-            config = SortformerConfig.nvidiaHighLatency
+            config = SortformerConfig.highContextV2_1
         } else if useNvidiaLowLatency {
-            config = SortformerConfig.nvidiaLowLatency
+            config = SortformerConfig.balancedV2_1
         } else {
-            config = SortformerConfig.default
+            config = SortformerConfig.default  // gradient-descent uses the default
         }
         config.debugMode = debugMode
         config.predScoreThreshold = threshold
-        let diarizer = SortformerDiarizer(config: config)
+        if let v = silenceThreshold { config.silenceThreshold = v }
+        if let v = scoresBoostLatest { config.scoresBoostLatest = v }
+        if let v = strongBoostRate { config.strongBoostRate = v }
+        if let v = weakBoostRate { config.weakBoostRate = v }
+        if let v = minPosScoresRate { config.minPosScoresRate = v }
+        if let v = spkcacheSilFramesPerSpk { config.spkcacheSilFramesPerSpk = v }
+        // Allow overriding the timeline binarization thresholds (sortformerDefault = 0.5/0.5).
+        let diarizer: SortformerDiarizer
+        if onsetThreshold != nil || offsetThreshold != nil {
+            let timeline = DiarizerTimelineConfig(
+                numSpeakers: config.numSpeakers,
+                frameDurationSeconds: Float(config.frameDurationSeconds),
+                onsetThreshold: onsetThreshold ?? 0.5,
+                offsetThreshold: offsetThreshold ?? onsetThreshold ?? 0.5
+            )
+            diarizer = SortformerDiarizer(config: config, timelineConfig: timeline)
+        } else {
+            diarizer = SortformerDiarizer(config: config)
+        }
 
         do {
             if useHuggingFace {
-                // Clear cache to force re-download
-                let cacheDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-                    .appendingPathComponent("FluidAudio/Models/sortformer")
-                try? FileManager.default.removeItem(at: cacheDir)
-                print("   Downloading models from HuggingFace...")
-                fflush(stdout)
-
                 let models = try await SortformerModels.loadFromHuggingFace(config: config)
                 diarizer.initialize(models: models)
             } else {
+                guard FileManager.default.fileExists(atPath: pipelineURL.path) else {
+                    print("ERROR: Local pipeline model not found: \(pipelineURL.path)")
+                    return
+                }
                 try await diarizer.initialize(
                     mainModelPath: pipelineURL
                 )
             }
         } catch {
-            print("❌ Failed to initialize Sortformer: \(error)")
+            print("Failed to initialize Sortformer: \(error)")
             return
         }
 
         let modelLoadTime = Date().timeIntervalSince(modelLoadStart)
-        print("✅ Models loaded in \(String(format: "%.2f", modelLoadTime))s\n")
+        print("Models loaded in \(String(format: "%.2f", modelLoadTime))s\n")
         fflush(stdout)
 
         // Process each file
@@ -324,6 +394,7 @@ enum SortformerBenchmark {
                 diarizer: diarizer,
                 modelLoadTime: modelLoadTime,
                 threshold: threshold,
+                collarSeconds: collarSeconds,
                 verbose: verbose
             )
 
@@ -331,14 +402,14 @@ enum SortformerBenchmark {
                 allResults.append(result)
 
                 // Print summary
-                print("📊 Results for \(meetingName):")
+                print("Results for \(meetingName):")
                 print("   DER: \(String(format: "%.1f", result.der))%")
                 print("   RTFx: \(String(format: "%.1f", result.rtfx))x")
                 print("   Speakers: \(result.detectedSpeakers) detected / \(result.groundTruthSpeakers) truth")
 
                 // Save progress after each file
-                saveProgress(results: allResults, to: progressFile)
-                print("💾 Progress saved (\(allResults.count) files complete)")
+                DiarizationBenchmarkUtils.saveProgress(results: allResults, to: progressFile)
+                print("Progress saved (\(allResults.count) files complete)")
             }
             fflush(stdout)
 
@@ -347,26 +418,113 @@ enum SortformerBenchmark {
         }
 
         // Print final summary
-        printFinalSummary(results: allResults)
+        DiarizationBenchmarkUtils.printFinalSummary(
+            results: allResults,
+            title: "SORTFORMER BENCHMARK SUMMARY",
+            derTargets: [15, 20]
+        )
 
         // Save results
         if let outputPath = outputFile {
-            saveJSONResults(results: allResults, to: outputPath)
+            DiarizationBenchmarkUtils.saveJSONResults(results: allResults, to: outputPath)
+        }
+    }
+
+    /// Whole-file offline benchmark over the dataset using the fused offline Sortformer model.
+    private static func runOfflineBenchmark(
+        filesToProcess: [String],
+        completedResults: [BenchmarkResult],
+        completedMeetings: Set<String>,
+        dataset: Dataset,
+        palettized: Bool,
+        modelPath: String?,
+        useHuggingFace: Bool,
+        threshold: Float,
+        collarSeconds: Double,
+        verbose: Bool,
+        progressFile: String,
+        outputFile: String?
+    ) async {
+        print("Loading offline Sortformer model...")
+        fflush(stdout)
+        let modelLoadStart = Date()
+
+        var offlineConfig = OfflineSortformerConfig.offlineV2_1
+        if palettized { offlineConfig.precision = .palettized }
+        let diarizer = OfflineSortformerDiarizer(config: offlineConfig)
+
+        do {
+            if let modelPath = modelPath, !useHuggingFace {
+                try await diarizer.initialize(modelPath: URL(fileURLWithPath: modelPath))
+            } else {
+                try await diarizer.initializeFromHuggingFace()
+            }
+        } catch {
+            print("Failed to initialize offline Sortformer: \(error)")
+            return
+        }
+        let modelLoadTime = Date().timeIntervalSince(modelLoadStart)
+        print(
+            "Model loaded in \(String(format: "%.2f", modelLoadTime))s (precision: \(offlineConfig.precision.rawValue))\n"
+        )
+        fflush(stdout)
+
+        var allResults: [BenchmarkResult] = completedResults
+        for (fileIndex, meetingName) in filesToProcess.enumerated() {
+            if completedMeetings.contains(meetingName) {
+                print("[\(fileIndex + 1)/\(filesToProcess.count)] Skipping (already done): \(meetingName)")
+                continue
+            }
+            print(String(repeating: "=", count: 60))
+            print("[\(fileIndex + 1)/\(filesToProcess.count)] Processing (offline): \(meetingName)")
+            print(String(repeating: "=", count: 60))
+            fflush(stdout)
+
+            let result = await processMeeting(
+                meetingName: meetingName,
+                dataset: dataset,
+                diarizer: nil,
+                offlineDiarizer: diarizer,
+                modelLoadTime: modelLoadTime,
+                threshold: threshold,
+                collarSeconds: collarSeconds,
+                verbose: verbose)
+
+            if let result = result {
+                allResults.append(result)
+                print("Results for \(meetingName):")
+                print("   DER: \(String(format: "%.1f", result.der))%")
+                print("   RTFx: \(String(format: "%.1f", result.rtfx))x")
+                print("   Speakers: \(result.detectedSpeakers) detected / \(result.groundTruthSpeakers) truth")
+                DiarizationBenchmarkUtils.saveProgress(results: allResults, to: progressFile)
+            }
+            fflush(stdout)
+        }
+
+        DiarizationBenchmarkUtils.printFinalSummary(
+            results: allResults,
+            title: "SORTFORMER OFFLINE BENCHMARK SUMMARY",
+            derTargets: [15, 20])
+
+        if let outputPath = outputFile {
+            DiarizationBenchmarkUtils.saveJSONResults(results: allResults, to: outputPath)
         }
     }
 
     private static func processMeeting(
         meetingName: String,
         dataset: Dataset,
-        diarizer: SortformerDiarizer,
+        diarizer: SortformerDiarizer?,
+        offlineDiarizer: OfflineSortformerDiarizer? = nil,
         modelLoadTime: Double,
         threshold: Float,
+        collarSeconds: Double,
         verbose: Bool
     ) async -> BenchmarkResult? {
 
-        let audioPath = getAudioPath(for: meetingName, dataset: dataset)
+        let audioPath = DiarizationBenchmarkUtils.getAudioPath(for: meetingName, dataset: dataset)
         guard FileManager.default.fileExists(atPath: audioPath) else {
-            print("❌ Audio file not found: \(audioPath)")
+            print("Audio file not found: \(audioPath)")
             fflush(stdout)
             return nil
         }
@@ -388,20 +546,29 @@ enum SortformerBenchmark {
             // Process with progress reporting
             let startTime = Date()
             var lastProgressPrint = Date()
-            let result = try diarizer.processComplete(audioSamples) { processed, total, chunks in
-                // Print progress every 2 seconds
-                let now = Date()
-                if now.timeIntervalSince(lastProgressPrint) >= 2.0 {
-                    let percent = Float(processed) / Float(total) * 100
-                    let elapsed = now.timeIntervalSince(startTime)
-                    let processedSeconds = Float(processed) / 16000.0
-                    let currentRtfx = processedSeconds / Float(elapsed)
-                    print(
-                        "   Progress: \(String(format: "%.1f", percent))% | Chunks: \(chunks) | RTFx: \(String(format: "%.1f", currentRtfx))x"
-                    )
-                    fflush(stdout)
-                    lastProgressPrint = now
+            let result: DiarizerTimeline
+            if let offlineDiarizer = offlineDiarizer {
+                // Offline: one fused call per window, no streaming progress callback.
+                result = try offlineDiarizer.processComplete(audioSamples)
+            } else if let diarizer = diarizer {
+                result = try diarizer.processComplete(audioSamples) { processed, total, chunks in
+                    // Print progress every 2 seconds
+                    let now = Date()
+                    if now.timeIntervalSince(lastProgressPrint) >= 2.0 {
+                        let percent = Float(processed) / Float(total) * 100
+                        let elapsed = now.timeIntervalSince(startTime)
+                        let processedSeconds = Float(processed) / 16000.0
+                        let currentRtfx = processedSeconds / Float(elapsed)
+                        print(
+                            "   Progress: \(String(format: "%.1f", percent))% | Chunks: \(chunks) | RTFx: \(String(format: "%.1f", currentRtfx))x"
+                        )
+                        fflush(stdout)
+                        lastProgressPrint = now
+                    }
                 }
+            } else {
+                print("No diarizer provided")
+                return nil
             }
             let processingTime = Date().timeIntervalSince(startTime)
 
@@ -409,14 +576,17 @@ enum SortformerBenchmark {
             if verbose {
                 print("   Processing time: \(String(format: "%.2f", processingTime))s")
                 print("   RTFx: \(String(format: "%.1f", rtfx))x")
-                print("   Total frames: \(result.numFrames)")
+                print("   Total frames: \(result.numFinalizedFrames)")
             }
 
             // Extract segments
-            let segments = result.segments
+            var segments: [[DiarizerSegment]] = Array(repeating: [], count: result.config.numSpeakers)
+            for (index, speaker) in result.speakers {
+                segments[index] = speaker.finalizedSegments
+            }
 
             // Print probability statistics
-            let preds = result.framePredictions
+            let preds = result.finalizedPredictions
             let count = preds.count
             let minVal = preds.min() ?? 0
             let maxVal = preds.max() ?? 0
@@ -435,33 +605,39 @@ enum SortformerBenchmark {
             // Load ground truth from RTTM file (matches Python's approach)
             var groundTruth = loadRTTMGroundTruth(for: meetingName, dataset: dataset)
 
-            // Fall back to AMI XML annotations if no RTTM available (AMI only)
+            // Fall back to AMI word-aligned annotations if no RTTM available (AMI only)
             if groundTruth.isEmpty && dataset == .ami {
-                print("   [RTTM] No RTTM file, falling back to AMI annotations")
-                groundTruth = await AMIParser.loadAMIGroundTruth(
+                print("   [RTTM] No RTTM file, falling back to AMI word-aligned annotations")
+                groundTruth = try AMIParser.loadWordAlignedGroundTruth(
                     for: meetingName,
                     duration: duration
                 )
             }
 
             guard !groundTruth.isEmpty else {
-                print("⚠️ No ground truth found for \(meetingName)")
+                print("No ground truth found for \(meetingName)")
                 return nil
             }
 
-            // Get filtered predictions for simple DER calculation (matches Python/NeMo)
-            let filteredPredictions = result.framePredictions
-
-            // Calculate DER using simple frame-level approach (matches NeMo evaluation)
-            // Frame shift is 0.08s (80ms) to match NeMo's subsampling_factor * window_stride
-            let simpleMetrics = calculateSimpleDER(
-                predictions: filteredPredictions,
-                numFrames: result.numFrames,
-                numSpeakers: 4,
-                groundTruth: groundTruth,
-                threshold: threshold,
-                frameShift: 0.08  // 80ms frames like NeMo
+            let referenceSegments = groundTruth.map {
+                DERSpeakerSegment(
+                    speaker: $0.speakerId,
+                    start: Double($0.startTimeSeconds),
+                    end: Double($0.endTimeSeconds)
+                )
+            }
+            let hypothesisSegments = segmentsToDERSegments(segments)
+            let derResult = DiarizationDER.compute(
+                ref: referenceSegments,
+                hyp: hypothesisSegments,
+                frameStep: derFrameStepSeconds,
+                collar: collarSeconds
             )
+            let totalRefSpeech = max(derResult.totalRefSpeech, .leastNonzeroMagnitude)
+            let derPercent = Float(derResult.der * 100)
+            let missPercent = Float(derResult.miss / totalRefSpeech * 100)
+            let faPercent = Float(derResult.falseAlarm / totalRefSpeech * 100)
+            let sePercent = Float(derResult.confusion / totalRefSpeech * 100)
 
             // Count detected speakers
             let detectedSpeakers = segments.reduce(into: Set<Int>()) {
@@ -473,20 +649,20 @@ enum SortformerBenchmark {
             switch dataset {
             case .ami:
                 groundTruthSpeakers = AMIParser.getGroundTruthSpeakerCount(for: meetingName)
-            case .voxconverse, .callhome:
+            default:
                 // Count unique speakers from ground truth
                 groundTruthSpeakers = Set(groundTruth.map { $0.speakerId }).count
             }
 
             return BenchmarkResult(
                 meetingName: meetingName,
-                der: simpleMetrics.der,
-                missRate: simpleMetrics.miss,
-                falseAlarmRate: simpleMetrics.fa,
-                speakerErrorRate: simpleMetrics.se,
+                der: derPercent,
+                missRate: missPercent,
+                falseAlarmRate: faPercent,
+                speakerErrorRate: sePercent,
                 rtfx: rtfx,
                 processingTime: processingTime,
-                totalFrames: result.numFrames,
+                totalFrames: result.numFinalizedFrames,
                 detectedSpeakers: detectedSpeakers,
                 groundTruthSpeakers: groundTruthSpeakers,
                 modelLoadTime: modelLoadTime,
@@ -494,267 +670,7 @@ enum SortformerBenchmark {
             )
 
         } catch {
-            print("❌ Error processing \(meetingName): \(error)")
-            return nil
-        }
-    }
-
-    private static func getAMIFiles(maxFiles: Int?) -> [String] {
-        // Official AMI SDM test set (16 meetings) - matches NeMo evaluation
-        let allMeetings = [
-            "EN2002a", "EN2002b", "EN2002c", "EN2002d",
-            "ES2004a", "ES2004b", "ES2004c", "ES2004d",
-            "IS1009a", "IS1009b", "IS1009c", "IS1009d",
-            "TS3003a", "TS3003b", "TS3003c", "TS3003d",
-        ]
-
-        var availableMeetings: [String] = []
-        for meeting in allMeetings {
-            let path = getAudioPath(for: meeting, dataset: .ami)
-            if FileManager.default.fileExists(atPath: path) {
-                availableMeetings.append(meeting)
-            }
-        }
-
-        if let max = maxFiles {
-            return Array(availableMeetings.prefix(max))
-        }
-
-        return availableMeetings
-    }
-
-    private static func getAudioPath(for meeting: String, dataset: Dataset) -> String {
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser
-        switch dataset {
-        case .ami:
-            return homeDir.appendingPathComponent(
-                "FluidAudioDatasets/ami_official/sdm/\(meeting).Mix-Headset.wav"
-            ).path
-        case .voxconverse:
-            return homeDir.appendingPathComponent(
-                "FluidAudioDatasets/voxconverse/voxconverse_test_wav/\(meeting).wav"
-            ).path
-        case .callhome:
-            return homeDir.appendingPathComponent(
-                "FluidAudioDatasets/callhome_eng/\(meeting).wav"
-            ).path
-        }
-    }
-
-    private static func getVoxConverseFiles(maxFiles: Int?) -> [String] {
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser
-        let voxDir = homeDir.appendingPathComponent(
-            "FluidAudioDatasets/voxconverse/voxconverse_test_wav"
-        )
-
-        guard
-            let files = try? FileManager.default.contentsOfDirectory(
-                at: voxDir,
-                includingPropertiesForKeys: nil
-            )
-        else {
-            return []
-        }
-
-        var availableMeetings: [String] = []
-        for file in files where file.pathExtension == "wav" {
-            let name = file.deletingPathExtension().lastPathComponent
-            // Check that RTTM file exists
-            let rttmPath = homeDir.appendingPathComponent(
-                "FluidAudioDatasets/voxconverse/rttm_repo/test/\(name).rttm"
-            )
-            if FileManager.default.fileExists(atPath: rttmPath.path) {
-                availableMeetings.append(name)
-            }
-        }
-
-        // Sort alphabetically for reproducibility
-        availableMeetings.sort()
-
-        if let max = maxFiles {
-            return Array(availableMeetings.prefix(max))
-        }
-
-        return availableMeetings
-    }
-
-    private static func getCALLHOMEFiles(maxFiles: Int?) -> [String] {
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser
-        let callhomeDir = homeDir.appendingPathComponent("FluidAudioDatasets/callhome_eng")
-
-        guard
-            let files = try? FileManager.default.contentsOfDirectory(
-                at: callhomeDir,
-                includingPropertiesForKeys: nil
-            )
-        else {
-            return []
-        }
-
-        var availableMeetings: [String] = []
-        for file in files where file.pathExtension == "wav" {
-            let name = file.deletingPathExtension().lastPathComponent
-            // Check that RTTM file exists
-            let rttmPath = callhomeDir.appendingPathComponent("rttm/\(name).rttm")
-            if FileManager.default.fileExists(atPath: rttmPath.path) {
-                availableMeetings.append(name)
-            }
-        }
-
-        // Sort alphabetically for reproducibility
-        availableMeetings.sort()
-
-        if let max = maxFiles {
-            return Array(availableMeetings.prefix(max))
-        }
-
-        return availableMeetings
-    }
-
-    private static func printFinalSummary(results: [BenchmarkResult]) {
-        guard !results.isEmpty else { return }
-
-        print("\n" + String(repeating: "=", count: 80))
-        print("SORTFORMER BENCHMARK SUMMARY")
-        print(String(repeating: "=", count: 80))
-
-        print("📋 Results Sorted by DER:")
-        print(String(repeating: "-", count: 70))
-        print("Meeting        DER %    Miss %     FA %     SE %   Speakers     RTFx")
-        print(String(repeating: "-", count: 70))
-
-        for result in results.sorted(by: { $0.der < $1.der }) {
-            let speakerInfo = "\(result.detectedSpeakers)/\(result.groundTruthSpeakers)"
-            let meetingCol = result.meetingName.padding(toLength: 12, withPad: " ", startingAt: 0)
-            let speakerCol = speakerInfo.padding(toLength: 10, withPad: " ", startingAt: 0)
-            print(
-                String(
-                    format: "%@ %8.1f %8.1f %8.1f %8.1f %@ %8.1f",
-                    meetingCol,
-                    result.der,
-                    result.missRate,
-                    result.falseAlarmRate,
-                    result.speakerErrorRate,
-                    speakerCol,
-                    result.rtfx))
-        }
-        print(String(repeating: "-", count: 70))
-
-        let count = Float(results.count)
-        let avgDER = results.map { $0.der }.reduce(0, +) / count
-        let avgMiss = results.map { $0.missRate }.reduce(0, +) / count
-        let avgFA = results.map { $0.falseAlarmRate }.reduce(0, +) / count
-        let avgSE = results.map { $0.speakerErrorRate }.reduce(0, +) / count
-        let avgRTFx = results.map { $0.rtfx }.reduce(0, +) / count
-
-        print(
-            String(
-                format: "AVERAGE      %8.1f %8.1f %8.1f %8.1f         - %8.1f",
-                avgDER, avgMiss, avgFA, avgSE, avgRTFx))
-        print(String(repeating: "=", count: 70))
-
-        print("\n✅ Target Check:")
-        if avgDER < 15 {
-            print("   ✅ DER < 15% (achieved: \(String(format: "%.1f", avgDER))%)")
-        } else if avgDER < 20 {
-            print("   🟡 DER < 20% (achieved: \(String(format: "%.1f", avgDER))%)")
-        } else {
-            print("   ❌ DER > 20% (achieved: \(String(format: "%.1f", avgDER))%)")
-        }
-
-        if avgRTFx > 1 {
-            print("   ✅ RTFx > 1x (achieved: \(String(format: "%.1f", avgRTFx))x)")
-        } else {
-            print("   ❌ RTFx < 1x (achieved: \(String(format: "%.1f", avgRTFx))x)")
-        }
-    }
-
-    private static func saveJSONResults(results: [BenchmarkResult], to path: String) {
-        let jsonData = results.map { result in
-            resultToDict(result)
-        }
-
-        do {
-            let data = try JSONSerialization.data(withJSONObject: jsonData, options: .prettyPrinted)
-            try data.write(to: URL(fileURLWithPath: path))
-            print("💾 JSON results saved to: \(path)")
-        } catch {
-            print("❌ Failed to save JSON: \(error)")
-        }
-    }
-
-    // MARK: - Progress Save/Load
-
-    private static func resultToDict(_ result: BenchmarkResult) -> [String: Any] {
-        return [
-            "meeting": result.meetingName,
-            "der": result.der,
-            "missRate": result.missRate,
-            "falseAlarmRate": result.falseAlarmRate,
-            "speakerErrorRate": result.speakerErrorRate,
-            "rtfx": result.rtfx,
-            "processingTime": result.processingTime,
-            "totalFrames": result.totalFrames,
-            "detectedSpeakers": result.detectedSpeakers,
-            "groundTruthSpeakers": result.groundTruthSpeakers,
-            "modelLoadTime": result.modelLoadTime,
-            "audioLoadTime": result.audioLoadTime,
-        ]
-    }
-
-    private static func saveProgress(results: [BenchmarkResult], to path: String) {
-        let jsonData = results.map { resultToDict($0) }
-        do {
-            let data = try JSONSerialization.data(withJSONObject: jsonData, options: .prettyPrinted)
-            try data.write(to: URL(fileURLWithPath: path))
-        } catch {
-            print("⚠️ Failed to save progress: \(error)")
-        }
-    }
-
-    private static func loadProgress(from path: String) -> [BenchmarkResult]? {
-        guard FileManager.default.fileExists(atPath: path) else { return nil }
-
-        do {
-            let data = try Data(contentsOf: URL(fileURLWithPath: path))
-            guard let jsonArray = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-                return nil
-            }
-
-            return jsonArray.compactMap { dict -> BenchmarkResult? in
-                guard let meeting = dict["meeting"] as? String,
-                    let der = (dict["der"] as? NSNumber)?.floatValue,
-                    let missRate = (dict["missRate"] as? NSNumber)?.floatValue,
-                    let falseAlarmRate = (dict["falseAlarmRate"] as? NSNumber)?.floatValue,
-                    let speakerErrorRate = (dict["speakerErrorRate"] as? NSNumber)?.floatValue,
-                    let rtfx = (dict["rtfx"] as? NSNumber)?.floatValue,
-                    let processingTime = (dict["processingTime"] as? NSNumber)?.doubleValue,
-                    let totalFrames = (dict["totalFrames"] as? NSNumber)?.intValue,
-                    let detectedSpeakers = (dict["detectedSpeakers"] as? NSNumber)?.intValue,
-                    let groundTruthSpeakers = (dict["groundTruthSpeakers"] as? NSNumber)?.intValue,
-                    let modelLoadTime = (dict["modelLoadTime"] as? NSNumber)?.doubleValue,
-                    let audioLoadTime = (dict["audioLoadTime"] as? NSNumber)?.doubleValue
-                else {
-                    return nil
-                }
-
-                return BenchmarkResult(
-                    meetingName: meeting,
-                    der: der,
-                    missRate: missRate,
-                    falseAlarmRate: falseAlarmRate,
-                    speakerErrorRate: speakerErrorRate,
-                    rtfx: rtfx,
-                    processingTime: processingTime,
-                    totalFrames: totalFrames,
-                    detectedSpeakers: detectedSpeakers,
-                    groundTruthSpeakers: groundTruthSpeakers,
-                    modelLoadTime: modelLoadTime,
-                    audioLoadTime: audioLoadTime
-                )
-            }
-        } catch {
-            print("⚠️ Failed to load progress: \(error)")
+            print("Error processing \(meetingName): \(error)")
             return nil
         }
     }
@@ -764,23 +680,11 @@ enum SortformerBenchmark {
     /// Load ground truth from RTTM file like Python does
     /// Format: SPEAKER <meeting_id> 1 <start_time> <duration> <NA> <NA> <speaker_id> <NA> <NA>
     private static func loadRTTMGroundTruth(for meetingName: String, dataset: Dataset) -> [TimedSpeakerSegment] {
-        // Determine RTTM path based on dataset
-        let rttmPath: String
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser
-        switch dataset {
-        case .ami:
-            rttmPath = "Streaming-Sortformer-Conversion/\(meetingName).rttm"
-        case .voxconverse:
-            rttmPath =
-                homeDir.appendingPathComponent(
-                    "FluidAudioDatasets/voxconverse/rttm_repo/test/\(meetingName).rttm"
-                ).path
-        case .callhome:
-            rttmPath =
-                homeDir.appendingPathComponent(
-                    "FluidAudioDatasets/callhome_eng/rttm/\(meetingName).rttm"
-                ).path
+        guard let rttmURL = DiarizationBenchmarkUtils.getRTTMURL(for: meetingName, dataset: dataset) else {
+            print("   [RTTM] No RTTM URL for \(meetingName)")
+            return []
         }
+        let rttmPath = rttmURL.path
 
         guard FileManager.default.fileExists(atPath: rttmPath) else {
             print("   [RTTM] File not found: \(rttmPath)")
@@ -828,135 +732,18 @@ enum SortformerBenchmark {
         return segments
     }
 
-    // MARK: - Simple Frame-Level DER (matches Python's calculation)
-
-    /// Calculate DER using simple frame-level binary comparison like Python
-    /// This matches the NeMo evaluation approach without collar or complex segment overlap
-    private static func calculateSimpleDER(
-        predictions: [Float],
-        numFrames: Int,
-        numSpeakers: Int,
-        groundTruth: [TimedSpeakerSegment],
-        threshold: Float,
-        frameShift: Float  // 0.08 for 80ms frames
-    ) -> (der: Float, miss: Float, fa: Float, se: Float) {
-        // Create reference binary matrix [numFrames, numSpeakers]
-        var refBinary = [[Float]](repeating: [Float](repeating: 0.0, count: numSpeakers), count: numFrames)
-
-        // Map ground truth speakers to indices
-        let speakerLabels = Array(Set(groundTruth.map { $0.speakerId })).sorted()
-        var speakerMap = [String: Int]()
-        for (idx, label) in speakerLabels.enumerated() {
-            if idx < numSpeakers {
-                speakerMap[label] = idx
+    private static func segmentsToDERSegments(
+        _ segments: [[DiarizerSegment]]
+    ) -> [DERSpeakerSegment] {
+        segments.flatMap { speakerSegments in
+            speakerSegments.map { segment in
+                DERSpeakerSegment(
+                    speaker: segment.speakerLabel,
+                    start: Double(segment.startTime),
+                    end: Double(segment.endTime)
+                )
             }
         }
-
-        // Fill reference binary from ground truth segments
-        for segment in groundTruth {
-            guard let spkIdx = speakerMap[segment.speakerId] else { continue }
-            let startFrame = max(0, min(Int(segment.startTimeSeconds / frameShift), numFrames))
-            let endFrame = max(0, min(Int(segment.endTimeSeconds / frameShift), numFrames))
-            for frame in startFrame..<endFrame {
-                refBinary[frame][spkIdx] = 1.0
-            }
-        }
-
-        // Create prediction binary matrix
-        var predBinary = [[Float]](repeating: [Float](repeating: 0.0, count: numSpeakers), count: numFrames)
-        for frame in 0..<numFrames {
-            for spk in 0..<numSpeakers {
-                let idx = frame * numSpeakers + spk
-                if idx < predictions.count {
-                    predBinary[frame][spk] = predictions[idx] > threshold ? 1.0 : 0.0
-                }
-            }
-        }
-
-        // Try all permutations to find best DER
-        let permutations = generatePermutations(numSpeakers)
-        var bestDER: Float = .infinity
-        var bestMiss: Float = 0
-        var bestFA: Float = 0
-        var bestSE: Float = 0
-
-        for perm in permutations {
-            var missFrames: Float = 0
-            var faFrames: Float = 0
-            var seFrames: Float = 0
-            var totalRefSpeech: Float = 0
-
-            for frame in 0..<numFrames {
-                let refSpeech = refBinary[frame].contains(where: { $0 > 0 })
-                var predSpeechPermuted = false
-                for spk in 0..<numSpeakers {
-                    if predBinary[frame][perm[spk]] > 0 {
-                        predSpeechPermuted = true
-                        break
-                    }
-                }
-
-                if refSpeech {
-                    totalRefSpeech += 1
-                }
-
-                if refSpeech && !predSpeechPermuted {
-                    missFrames += 1
-                } else if !refSpeech && predSpeechPermuted {
-                    faFrames += 1
-                } else if refSpeech && predSpeechPermuted {
-                    // Calculate speaker error
-                    var refSpks = Set<Int>()
-                    var predSpks = Set<Int>()
-                    for spk in 0..<numSpeakers {
-                        if refBinary[frame][spk] > 0 {
-                            refSpks.insert(spk)
-                        }
-                        if predBinary[frame][perm[spk]] > 0 {
-                            predSpks.insert(spk)
-                        }
-                    }
-                    let symDiff = refSpks.symmetricDifference(predSpks)
-                    seFrames += Float(symDiff.count) / 2.0
-                }
-            }
-
-            if totalRefSpeech > 0 {
-                let der = (missFrames + faFrames + seFrames) / totalRefSpeech * 100
-                if der < bestDER {
-                    bestDER = der
-                    bestMiss = missFrames / totalRefSpeech * 100
-                    bestFA = faFrames / totalRefSpeech * 100
-                    bestSE = seFrames / totalRefSpeech * 100
-                }
-            }
-        }
-
-        return (bestDER, bestMiss, bestFA, bestSE)
-    }
-
-    /// Generate all permutations of 0..<n
-    private static func generatePermutations(_ n: Int) -> [[Int]] {
-        if n == 0 { return [[]] }
-        if n == 1 { return [[0]] }
-
-        var result: [[Int]] = []
-        var arr = Array(0..<n)
-
-        func permute(_ start: Int) {
-            if start == n {
-                result.append(arr)
-                return
-            }
-            for i in start..<n {
-                arr.swapAt(start, i)
-                permute(start + 1)
-                arr.swapAt(start, i)
-            }
-        }
-
-        permute(0)
-        return result
     }
 }
 #endif

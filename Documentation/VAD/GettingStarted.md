@@ -4,6 +4,11 @@ Fluid Audio ships the Silero VAD converted for Core ML together with Silero-styl
 timestamp extraction and streaming hysteresis. If you need help tuning the
 parameters for your use case, reach out on Discord.
 
+For comparison of Silero-VAD compared to other models, see this. We are running
+the 256 ms unified Silero v6.2.1 Core ML artifact.
+
+https://github.com/snakers4/silero-vad/wiki/Quality-Metrics
+
 ## Quick Start
 
 Need chunk-level probabilities or state for custom pipelines? Call `process(_:)`
@@ -29,7 +34,7 @@ Stage the Core ML bundle yourself when the runtime cannot reach HuggingFace.
 
 ### Required asset
 
-- `silero-vad-unified-256ms-v6.0.0.mlmodelc`
+- `silero-vad-unified-256ms-v6.2.1.mlmodelc`
 
 The bundle lives in the `FluidInference/silero-vad-coreml` repo. Keep the folder name intact so `coremldata.bin` remains discoverable.
 
@@ -38,12 +43,12 @@ The bundle lives in the `FluidInference/silero-vad-coreml` repo. Keep the folder
 ```
 /opt/models
 └── silero-vad-coreml
-    └── silero-vad-unified-256ms-v6.0.0.mlmodelc
+    └── silero-vad-unified-256ms-v6.2.1.mlmodelc
         ├── coremldata.bin
         └── ...
 ```
 
-Clone with Git LFS, download the archive from the HuggingFace UI, or copy from a machine that already initialized `VadManager()` (cache path: `~/Library/Application Support/FluidAudio/Models/silero-vad-coreml`).
+Clone with Git LFS, download the archive from the HuggingFace UI, or copy from a machine that already initialized `VadManager()` (default cache path: `~/Library/Application Support/FluidAudio/Models/silero-vad`).
 
 ### Loading without downloads
 
@@ -55,7 +60,7 @@ import CoreML
 
 Task {
     do {
-        let modelURL = URL(fileURLWithPath: "/opt/models/silero-vad-coreml/silero-vad-unified-256ms-v6.0.0.mlmodelc", isDirectory: true)
+        let modelURL = URL(fileURLWithPath: "/opt/models/silero-vad-coreml/silero-vad-unified-256ms-v6.2.1.mlmodelc", isDirectory: true)
 
         var configuration = MLModelConfiguration()
         configuration.computeUnits = .cpuOnly
@@ -209,7 +214,7 @@ Start with the general-purpose `process` command, which runs the diarization
 pipeline (and therefore VAD) end-to-end on a single file:
 
 ```bash
-swift run fluidaudio process path/to/audio.wav
+swift run fluidaudiocli process path/to/audio.wav
 ```
 
 Once you need to experiment with the VAD-specific heuristics directly, use the
@@ -217,21 +222,21 @@ CLI commands below:
 
 ```bash
 # Inspect offline segments (default mode is offline only)
-swift run fluidaudio vad-analyze path/to/audio.wav
+swift run fluidaudiocli vad-analyze path/to/audio.wav
 
 # Streaming only, 128 ms chunks, tighter silence rules (timestamps are emitted in seconds)
-swift run fluidaudio vad-analyze path/to/audio.wav --streaming --min-silence-ms 300
+swift run fluidaudiocli vad-analyze path/to/audio.wav --streaming --min-silence-ms 300
 
 # Run both offline + streaming in one pass
-swift run fluidaudio vad-analyze path/to/audio.wav --mode both
+swift run fluidaudiocli vad-analyze path/to/audio.wav --mode both
 
 # Classic benchmark tooling remains available
-swift run fluidaudio vad-benchmark --num-files 50 --threshold 0.3
+swift run fluidaudiocli vad-benchmark --num-files 50 --threshold 0.3
 ```
 
-`swift run fluidaudio vad-analyze --help` prints the full list of tuning
+`swift run fluidaudiocli vad-analyze --help` prints the full list of tuning
 options, including negative-threshold overrides and max-duration splitting.
 Offline runs emit an RTFx summary calculated from per-chunk inference time. Use
 `--mode both` if you also want to see streaming start/end events in the same run.
 
-Datasets for benchmarking can be fetched with `swift run fluidaudio download --dataset vad`.
+Datasets for benchmarking can be fetched with `swift run fluidaudiocli download --dataset vad`.

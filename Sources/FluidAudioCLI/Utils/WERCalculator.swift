@@ -15,10 +15,18 @@ enum WERCalculator {
         let hypWords = hypothesis.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
         let refWords = reference.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
 
-        let distance = editDistance(hypWords, refWords)
-        let wer = refWords.isEmpty ? 0.0 : Double(distance.total) / Double(refWords.count)
+        return calculateWordMetrics(hypothesis: hypWords, reference: refWords)
+    }
 
-        return (wer, distance.insertions, distance.deletions, distance.substitutions, refWords.count)
+    /// Score already-normalized tokens without applying text normalization again.
+    static func calculateWordMetrics(
+        hypothesis: [String], reference: [String]
+    )
+        -> (wer: Double, insertions: Int, deletions: Int, substitutions: Int, totalWords: Int)
+    {
+        let distance = editDistance(hypothesis, reference)
+        let wer = reference.isEmpty ? 0.0 : Double(distance.total) / Double(reference.count)
+        return (wer, distance.insertions, distance.deletions, distance.substitutions, reference.count)
     }
 
     /// Compute character-level CER alongside WER if needed.
@@ -55,6 +63,119 @@ enum WERCalculator {
         )
     }
 
+    /// WER + CER using the conservative `basicNormalize` path (lowercase, NFKD,
+    /// strip symbols/punctuation, collapse whitespace, KEEP diacritics).
+    ///
+    /// Use for non-English languages where `normalize`'s English-specific
+    /// transformations (British→American, contraction expansion, English
+    /// abbreviation/number-word folding) inflate WER by mangling hypothesis
+    /// and reference asymmetrically. This matches the "basic" normalizer
+    /// reported in the Whisper paper / NeMo `BasicTextProcessing` and is the
+    /// standard for multilingual ASR leaderboards (FLEURS, MLS).
+    static func calculateBasicWERAndCER(
+        hypothesis rawHypothesis: String, reference rawReference: String,
+        spellOutLocale: Locale? = nil
+    )
+        -> (
+            wer: Double, cer: Double, insertions: Int, deletions: Int, substitutions: Int, totalWords: Int,
+            totalCharacters: Int
+        )
+    {
+        let hypothesis = TextNormalizer.basicNormalize(rawHypothesis, spellOutLocale: spellOutLocale)
+        let reference = TextNormalizer.basicNormalize(rawReference, spellOutLocale: spellOutLocale)
+
+        let hypWords = hypothesis.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
+        let refWords = reference.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
+
+        let wordDistance = editDistance(hypWords, refWords)
+        let wer = refWords.isEmpty ? 0.0 : Double(wordDistance.total) / Double(refWords.count)
+
+        let hypChars = Array(hypothesis.replacingOccurrences(of: " ", with: ""))
+        let refChars = Array(reference.replacingOccurrences(of: " ", with: ""))
+        let charDistance = editDistance(hypChars.map(String.init), refChars.map(String.init))
+        let cer = refChars.isEmpty ? 0.0 : Double(charDistance.total) / Double(refChars.count)
+
+        return (
+            wer,
+            cer,
+            wordDistance.insertions,
+            wordDistance.deletions,
+            wordDistance.substitutions,
+            refWords.count,
+            refChars.count
+        )
+    }
+
+    /// CJK-aware WER+CER. For languages without inter-word spaces (Japanese,
+    /// Korean, Chinese, …), whitespace-tokenized WER is a meaningless number
+    /// because hypothesis and reference disagree on segmentation. Both ESPnet
+    /// and OpenAI's Whisper paper report character-level edit rate as the
+    /// primary metric for these languages.
+    ///
+    /// This method:
+    ///   1. Strips all whitespace from both strings (so any segmentation
+    ///      differences are erased).
+    ///   2. Splits each into individual Unicode scalar / grapheme clusters.
+    ///   3. Returns character edit distance for both `wer` and `cer` fields.
+    ///
+    /// The two output fields are deliberately equal — keeping the same
+    /// return shape as `calculateWERAndCER` so callers can swap calculators
+    /// without changing downstream code.
+    static func calculateCJKMetrics(
+        hypothesis rawHypothesis: String, reference rawReference: String
+    )
+        -> (
+            wer: Double, cer: Double, insertions: Int, deletions: Int, substitutions: Int, totalWords: Int,
+            totalCharacters: Int
+        )
+    {
+        let hypothesis = TextNormalizer.normalize(rawHypothesis)
+        let reference = TextNormalizer.normalize(rawReference)
+
+        let hypChars = Array(
+            hypothesis
+                .components(separatedBy: .whitespacesAndNewlines)
+                .joined()
+        ).map(String.init)
+        let refChars = Array(
+            reference
+                .components(separatedBy: .whitespacesAndNewlines)
+                .joined()
+        ).map(String.init)
+
+        let charDistance = editDistance(hypChars, refChars)
+        let rate = refChars.isEmpty ? 0.0 : Double(charDistance.total) / Double(refChars.count)
+
+        return (
+            rate,
+            rate,
+            charDistance.insertions,
+            charDistance.deletions,
+            charDistance.substitutions,
+            refChars.count,
+            refChars.count
+        )
+    }
+
+    /// Returns true if the given FLEURS language code uses a CJK / no-space
+    /// script where word-level WER over whitespace tokens is not meaningful.
+    static func isCJKLanguage(_ fleursOrPromptCode: String) -> Bool {
+        let lc = fleursOrPromptCode.lowercased()
+        // FLEURS codes
+        if lc.hasPrefix("ja") || lc.hasPrefix("ko") {
+            return true
+        }
+        // Chinese variants
+        if lc.hasPrefix("cmn") || lc.hasPrefix("yue") || lc.hasPrefix("zh") {
+            return true
+        }
+        // Thai and Lao are also no-space scripts; include them defensively.
+        if lc.hasPrefix("th") || lc.hasPrefix("lo") {
+            return true
+        }
+        return false
+    }
+
     private struct EditDistanceResult {
         let total: Int
         let insertions: Int
@@ -66,11 +187,13 @@ enum WERCalculator {
         let m = seq1.count
         let n = seq2.count
 
+        // seq1 is the hypothesis, seq2 the reference: an empty hypothesis is n
+        // deletions (reference words missing), an empty reference m insertions.
         if m == 0 {
-            return EditDistanceResult(total: n, insertions: n, deletions: 0, substitutions: 0)
+            return EditDistanceResult(total: n, insertions: 0, deletions: n, substitutions: 0)
         }
         if n == 0 {
-            return EditDistanceResult(total: m, insertions: 0, deletions: m, substitutions: 0)
+            return EditDistanceResult(total: m, insertions: m, deletions: 0, substitutions: 0)
         }
 
         var dp = Array(repeating: Array(repeating: 0, count: n + 1), count: m + 1)
@@ -107,10 +230,12 @@ enum WERCalculator {
                 i -= 1
                 j -= 1
             } else if i > 0 && dp[i][j] == dp[i - 1][j] + 1 {
-                deletions += 1
+                // hypothesis word with no reference counterpart
+                insertions += 1
                 i -= 1
             } else if j > 0 && dp[i][j] == dp[i][j - 1] + 1 {
-                insertions += 1
+                // reference word missing from the hypothesis
+                deletions += 1
                 j -= 1
             } else {
                 break

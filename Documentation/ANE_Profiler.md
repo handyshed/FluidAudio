@@ -1,0 +1,436 @@
+# ANE Profiler
+
+| | |
+|---|---|
+| **Measured** | 2026-06-05 |
+| **Machine** | MacBook, Apple Silicon M5, macOS (Darwin 25.x) |
+| **Config** | `computeUnits = .cpuAndNeuralEngine` (ANE allowed; capability, not production override) |
+| **Metric** | `MLComputePlan` `preferredComputeDevice` per op, counted (mlprogram ops / nn layers) |
+| **Size** | on-disk `.mlmodelc` bundle size (MB) |
+| **Lat** | per-call latency (ms). **Real audio, warm** for TDT v3, EOU, Nemotron, Pyannote offline, TTS. **Synthetic** (zero-input) for ja / zh / CTC-110M. One-time measurement (see Latency below). |
+| **Tool** | `Scripts/ane_profile.swift` (device split, reproducible) |
+
+> **Rule of thumb: the smaller the model, the less the ANE matters. Under ~50 MB it often isn't worth
+> it at all.** On a small graph the fixed cost of moving tensors to the Neural Engine and back
+> outweighs the speedup, so CoreML keeps it on CPU. Put ANE effort on the big graphs.
+>
+> All measured on Macbooks like M5.
+>
+> **Reading the Lat column.** Stages that run once per call show per-call time: `/ chunk`
+> (encoder/preprocessor, once per audio chunk) or `/ call` (single-shot). Stages that loop show
+> `T ms (N× @ p)` = ran N times at p ms each, T ms total. The loop count N **scales with output
+> length** (ASR decoders/joints, PocketTTS, so N is for this test clip), except Supertonic's
+> VectorEstimator, which is **fixed** at the denoising-step count (8).
+
+---
+
+# Computer-use decision models
+
+Measured separately on September 19, 2026: Apple M5 Pro, 24 GB, macOS 27.0.
+CUA-S1-FORMS uses real text inputs, not audio. With `.cpuAndNeuralEngine`, its
+plan assigns 149 operations to ANE and 24 to CPU; `.all` selects 173 GPU operations.
+
+| Model | ANE ops | GPU ops | CPU ops | Portable size | Warm model call |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CUA-S1-FORMS (`.cpuAndNeuralEngine`) | 149 (86.1%) | 0 | 24 (13.9%) | 1.51 MB | p50 0.929 ms / p95 0.973 ms |
+| CUA-S1-FORMS `ane-gather` (optional) | 162 (98.2%) | 0 | 3 (1.8%) | ~1.51 MB | paired p50 0.970 ms / p95 0.988 ms |
+
+Timing uses 30 Python Core ML calls over three real form inputs after warmup,
+excluding encoding and UI work. Counts are scheduler assignments, not measured
+runtime shares. See [the conversion toolkit](https://github.com/FluidInference/mobius/tree/codex/cua-s1-forms/models/computer-use/cua-s1-forms/coreml#device-placement) for the
+four-policy comparison, load timings, fallback reasons, protocol, and raw report.
+The optional unsigned-gather variant leaves only three input casts on CPU. Its
+matched ABBA comparison used 60 calls per model and measured 0.915 ms for the
+default versus 0.970 ms for `ane-gather`; more ANE placement was about 6% slower.
+The default artifact is retained. No utilization or energy saving was measured.
+
+# ASR
+
+| Model | Type | Chunk | ANE | GPU | CPU | ops | Size | Heavy graph → device |
+|-------|------|------:|----:|----:|----:|----:|-----:|----------------------|
+| Parakeet CTC 110M | batch (sliding-window) | 15 s (2 s overlap) | **97%** | 0% | 3% | 1353 | 101 MB | AudioEncoder → ANE |
+| Parakeet CTC Chinese | batch (sliding-window) | 15 s (2 s overlap) | **96%** | 0% | 4% | 1443 | 583 MB | Encoder → ANE |
+| Parakeet TDT v3 | batch (sliding-window) | 15 s (2 s overlap) | **93%** | 0% | 7% | 1484 | 463 MB | Encoder → ANE¹ |
+| Parakeet TDT Japanese | batch (sliding-window) | 15 s (2 s overlap) | **93%** | 0% | 7% | 1490 | 611 MB | Encoder → ANE |
+| Parakeet EOU | streaming | 160 / 320 / 1280 ms | **92%** | 0% | 8% | 1243 | 233 MB | streaming_encoder → ANE |
+| Nemotron Multilingual | streaming | 1120 / 2240 ms | **92%** | 0% | 8% | 1786 | 636 MB | encoder → ANE |
+| Nemotron EN | streaming | 560 / 1120 / 2240 ms | **90%** | 0% | 10% | 1788 | 602 MB | encoder_int8 → ANE |
+
+¹ v3's encoder *can* run 99% ANE but **ships on `.cpuAndGPU`** (+8% RTFx vs ANE on M-series). In
+production it runs on GPU, not ANE. The table shows ANE *capability* with the default config.
+
+**Component detail**
+
+### Parakeet TDT v3
+Latency here is **measured on real audio** (7.8 s clip, production config, 5-run average), not synthetic.
+
+| Component | ANE | GPU | CPU | ops | Size | Lat ms |
+|-----------|----:|----:|----:|----:|-----:|-------:|
+| Encoder | 99% | 0% | 1% | 1385 | 426 MB | 28.2 / chunk |
+| Decoder | 0% | 0% | 100% | 24 | 23 MB | 9 ms (40× @ 0.23) |
+| Joint | 0% | 0% | 100% | 24 | 13 MB | 23 ms (49× @ 0.46) |
+| Preprocessor | 0% | 0% | 100% | 51 | 1 MB | 3.2 / chunk |
+
+> Per 7.8 s of audio: 1 encoder call, ~40 decoder + ~49 joint steps. The joint loop totals ~22 ms,
+> rivaling the single 28 ms encoder call.
+
+### Parakeet TDT Japanese
+Lat is **synthetic** (zero-input), not real audio (no CLI transcribe path). Runs ~2x low; treat as a
+lower bound.
+
+| Component | ANE | GPU | CPU | ops | Size | Lat ms |
+|-----------|----:|----:|----:|----:|-----:|-------:|
+| Encoder | 99% | 0% | 1% | 1386 | 580 MB | 23.3 |
+| CtcDecoder | 100% | 0% | 0% | 4 | 7 MB | 0.25 |
+| Decoderv2 | 0% | 0% | 100% | 24 | 17 MB | 0.13 |
+| Jointerv2 | 0% | 0% | 100% | 24 | 6 MB | 0.16 |
+| Preprocessor | 0% | 0% | 100% | 52 | 1 MB | 0.92 |
+
+> `CtcDecoder` lands on ANE despite being tiny (7 MB), the exception to the rule that small models stay
+> on CPU.
+
+### Parakeet CTC Chinese
+Lat is **synthetic** (zero-input), not real audio; the zh CTC pipeline uses a separate manager not
+yet instrumented. Runs ~2x low; treat as a lower bound.
+
+| Component | ANE | GPU | CPU | ops | Size | Lat ms |
+|-----------|----:|----:|----:|----:|-----:|-------:|
+| Encoder fp32 | 99% | 0% | 1% | 1385 | 1130 MB | 24.2 |
+| Encoder int8 | 99% | 0% | 1% | 1385 | 568 MB | 23.4 |
+| Decoder | 100% | 0% | 0% | 6 | 14 MB | 0.69 |
+| Preprocessor | 0% | 0% | 100% | 52 | 1 MB | 0.95 |
+
+### Parakeet CTC 110M
+Lat is **synthetic** (zero-input); this is the keyword-spotting CTC variant with no transcribe CLI.
+Runs ~2x low; treat as a lower bound.
+
+| Component | ANE | GPU | CPU | ops | Size | Lat ms |
+|-----------|----:|----:|----:|----:|-----:|-------:|
+| AudioEncoder | 100% | 0% | 0% | 1315 | 98 MB | 8.5 |
+| CtcHead | 0% | 0% | 100% | 6 | 2 MB | 0.18 |
+| MelSpectrogram | 0% | 0% | 100% | 32 | 1 MB | 0.57 |
+
+### Parakeet EOU (1280ms)
+Latency **measured on real audio**, warm (the device-split/size columns are the 1280ms bundle; the Lat
+column was run on the **160ms** default CLI variant, so the encoder figure is that variant's).
+
+| Component | ANE | GPU | CPU | ops | Size | Lat ms |
+|-----------|----:|----:|----:|----:|-----:|-------:|
+| streaming_encoder | 97% | 0% | 3% | 1174 | 220 MB | 6.5 / chunk |
+| decoder | 0% | 0% | 100% | 14 | 8 MB | 30 ms (229× @ 0.13) |
+| joint_decision | 0% | 0% | 100% | 21 | 3 MB | 28 ms (229× @ 0.12) |
+
+> EOU doesn't ship a CoreML `preprocessor`. It computes mel features in native Swift
+> (`AudioMelSpectrogram`), so there's no preprocessor row. (Nemotron, by contrast, *does* run its
+> CoreML preprocessor.) decoder/joint go through the shared `RnntDecoder` (~229 steps for 7.8 s audio).
+
+### Nemotron EN
+Latency **measured on real audio**, warm (default 1120ms chunk, 7 chunks for 7.8 s). Uses the separate
+decoder then joint path.
+
+| Component | ANE | GPU | CPU | ops | Size | Lat ms |
+|-----------|----:|----:|----:|----:|-----:|-------:|
+| encoder_int8 | 97% | 0% | 3% | 1672 | 564 MB | ~13 / chunk (1st ~290 cold) |
+| preprocessor | 0% | 0% | 100% | 47 | 1 MB | 2.4 / chunk |
+| decoder | 0% | 0% | 100% | 24 | 15 MB | 44 ms (148× @ 0.30) |
+| joint | 0% | 0% | 100% | 12 | 4 MB | 23 ms (148× @ 0.15) |
+
+### Nemotron Multilingual
+Latency **measured on real audio**, warm (2240ms chunk, 4 chunks for 7.8 s). Default decode is the
+fused `decoder_joint` (B1).
+
+| Component | ANE | GPU | CPU | ops | Size | Lat ms |
+|-----------|----:|----:|----:|----:|-----:|-------:|
+| encoder | 96% | 0% | 4% | 1680 | 540 MB | 9.7 / chunk |
+| preprocessor | 0% | 0% | 100% | 47 | 1 MB | 1.9 / chunk |
+| decoder_joint | 54% | 0% | 46% | 28 | 47 MB | 79 ms (168× @ 0.47) |
+| joint | 100% | 0% | 0% | 12 | 19 MB | unused (B1 default) |
+| decoder | 0% | 0% | 100% | 19 | 29 MB | unused (B1 default) |
+
+> Unlike EN, the multilingual `joint` is fully ANE and `decoder_joint` is mixed (54% ANE).
+
+---
+
+# VAD
+
+| Model | Type | Chunk | ANE | GPU | CPU | ops | Size | Lat ms |
+|-------|------|------:|----:|----:|----:|----:|-----:|-------:|
+| Silero VAD (single graph) | streaming | 256 ms | 0% | 0% | 100% | 357 | 2 MB | 0.19 |
+
+---
+
+# Diarization (streaming)
+
+Compute plan (`Scripts/ane_profile.swift`, `--units all`) plus **warm per-call latency on real audio**
+(NVIDIA's 97.6 s 8-voice demo clip, M5 Pro, macOS 26.7; Nemotron via `nemotron3-diarize --profile`,
+Sortformer derived from wall RTFx over its 203 calls, so it includes host time and the cold first call).
+Both models are pure forward passes over `[speaker cache | FIFO | chunk]`; `T` is that packed length.
+
+| Model | Preset | Latency | Audio/call | T | ANE | GPU | CPU | ops | Size | ANE ms/call | GPU ms/call | ANE ms per audio-s |
+|-------|--------|--------:|-----------:|--:|----:|----:|----:|----:|-----:|------------:|------------:|-------------------:|
+| Sortformer v2.1 | fast | 1.04 s | 0.48 s | 242 | 94% | 0% | 6% | 1526 | 229 MB | 12.5 | 10.4 | 26 |
+| Sortformer v2.1 | high context | 30.4 s | 27.2 s | — | 94% | 0% | 6% | 1526 | 243 MB | — | — | — |
+| Sortformer v2.1 | offline (fused) | 30.7 s | 30.7 s | — | 99% | 0% | 1% | 1497 | 230 MB | — | — | — |
+| Nemotron 3 | low | 1.04 s | 0.72 s | 541 | 98% | 0% | 2% | 1178 | 190 MB | 27.1 | 12.0 | 38 |
+| Nemotron 3 | fast32 | 2.88 s | 2.56 s | 340 | 98% | 0% | 2% | 1178 | 190 MB | 11.6 | 12.6 | 4.5 |
+| Nemotron 3 | fast128 | 10.56 s | 10.24 s | 436 | 98% | 0% | 2% | 1178 | 190 MB | 20.6 | 37.0 | 2.0 |
+| Nemotron 3 | offline | 30.4 s | 27.2 s | 684 | 98%* | 0% | 2% | 1178 | 190 MB | fails* | 11.2 | — |
+| Nemotron 3 | fast32-split-w8a8 | 2.88 s | 2.56 s | 340 | 100% | 0% | 0% | 1649 | 95 MB | 9.7 | — | 3.8 |
+| Nemotron 3 | c128-split-w8a8 | 10.56 s | 10.24 s | 436 | 100% | 0% | 0% | 1649 | 95 MB | ~18 | — | 1.8 |
+
+\* `MLComputePlan` reports the placement CoreML *intends*; Nemotron 3 `offline` (3040 mel frames) fails
+`ANECCompile` at runtime and silently runs on the GPU. Chunk mel input ≤ 1376 frames compiles for the
+ANE; 1440+ does not. The split-graph presets bypass the cliff (host does feature stacking + the
+1024→512 projection).
+
+**Reading the table**
+
+- Sortformer's 2% CPU residue and Nemotron's 2% are index/gather ops around the state packing; the
+  split-graph variants move that packing to the host and leave a pure-fp transformer that is 100% ANE.
+- **Per-call cost scales with `T`, not with audio advanced.** Nemotron `low` (T=541) costs 2.2× Sortformer
+  fast (T=242) per call on the ANE and advances 1.5× the audio; at 1.04 s latency the two are within 1.5×
+  of each other per audio-second. Bigger Nemotron chunks amortize the fixed state: fast32 is 8× cheaper
+  than `low` per audio-second at higher DER-neutral latency, fast128 19× cheaper.
+- **The M5 Pro GPU beats the ANE at 1.04 s latency for both models** (Nemotron `low` 12.0 vs 27.1 ms,
+  Sortformer fast 10.4 vs 12.5) — ANE tiling of these packed sequences is unfavourable — while the ANE
+  wins for fast128 (20.6 vs 37.0). `.all` picks per-op, not
+  per-model, so choose the route explicitly for `low` on Macs; on iPhone the ANE is the only fast route.
+- Sortformer's first GPU run on a fresh process paid a ~2.4 s cold compile on call 1 (whole-clip RTFx
+  22× instead of 46×); the table's GPU figure is the warm second run. Its ANE cold cost is small.
+  Nemotron's cold ANE compile is ~1 s for the monolithic presets.
+- Sequence length is the cost: zero-shot layer drops, W8A8 on the monolithic graph, batch>1 on the ANE
+  and speaker-cache/FIFO shrinking were all measured and rejected (see the Nemotron 3 conversion notes);
+  the remaining lever is reusing the static state's attention across speaker-cache updates, untested.
+
+---
+
+# Diarization (offline)
+
+| Pipeline | Type | Chunk | ANE | GPU | CPU | ops | Size |
+|----------|------|------:|----:|----:|----:|----:|-----:|
+| Pyannote offline | batch (offline) | 10 s window | 49% | 0% | 51% | 233 | 22 MB |
+
+**Component detail**
+
+### Pyannote offline
+Latency **measured on real audio**, warm (`process --mode offline`, 7.8 s clip). Cold first-call is far
+higher (see warmup note below): segmentation was 1293 ms and embedding 410 ms/call on the cold run.
+
+| Component | ANE | GPU | CPU | ops | Size | Lat ms |
+|-----------|----:|----:|----:|----:|-----:|-------:|
+| Embedding (speaker embed) | 93% | 0% | 7% | 124 | 13 MB | 7.9 / call |
+| Segmentation | 0% | 0% | 100% | 58 | 6 MB | 55.4 / call |
+| FBank | 0% | 0% | 100% | 33 | 2 MB | 3.2 / call |
+| PldaRho | 0% | 0% | 100% | 18 | 1 MB | 0.15 / call |
+
+> Warm segmentation (55 ms) is the heaviest stage and is 100% CPU. The **cold-start penalty is the real
+> story here**: the first ANE/CPU call paid ~1.3 s (segmentation) and ~0.4 s (embedding) for model
+> compile + residency, 10-25x the warm cost.
+
+---
+
+# TTS
+
+Latency **measured on real synthesis**, warm (one short sentence; `tts --backend …`).
+
+**Summary**
+
+| Model | Type | ANE | GPU | CPU | ops | Size | Heavy graph → device |
+|-------|------|----:|----:|----:|----:|-----:|----------------------|
+| Kokoro ANE (7-stage) | batch (per utterance) | 75% | 0% | 25% | 1472 | 83 MB | Vocoder → ANE |
+| Supertonic (`--ve-variant fp16`, legacy) | batch (8-step diffusion) | 30% | 0% | 70% | 1365 | 192 MB | VectorEstimator → **CPU** (dynamic shapes can't use ANE) |
+| Supertonic (default, int4 L-bucketed) | batch (8-step diffusion) | ~90% | 0% | ~10% | 1289 | 102 MB | VectorEstimator → **ANE** (fixed L-buckets) |
+| PocketTTS (v2.1) | streaming (autoregressive) | ~9% | ~31% | ~60% | 2629 | ~330 MB | flow_decoder_fused → **ANE**; flowlm/cond → GPU; mimi → CPU |
+
+**Component detail**
+
+### Kokoro ANE (7-stage)
+| Component | ANE | GPU | CPU | ops | Size | Lat ms |
+|-----------|----:|----:|----:|----:|-----:|-------:|
+| Albert | 94% | 0% | 6% | 310 | 6 MB | 6.5 |
+| PostAlbert | 22% | 0% | 78% | 98 | 14 MB | 3.7 |
+| Alignment | 0% | 0% | 100% | 19 | 1 MB | 0.8 |
+| Prosody | 99% | 0% | 1% | 138 | 9 MB | 56.5 |
+| Noise | 0% | 0% | 100% | 239 | 5 MB | 61.6 |
+| Vocoder | 99% | 0% | 1% | 655 | 47 MB | 71.8 |
+| Tail | 0% | 0% | 100% | 13 | 1 MB | 9.6 |
+
+### PocketTTS (v2.1)
+Autoregressive: stages run many steps per utterance. Measured on M-series /
+macOS 26 with the v2.1 optimized packs. Only the fused flow decoder reaches the
+ANE; flowlm/cond run on GPU (the rank-5 KV-cache `scatter` is rejected by the
+ANE compiler at **any** precision), and mimi is CPU (fp16 streaming-state
+feedback produces audible artifacts on the ANE, and it is compute-bound anyway).
+
+| Component | ANE | GPU | CPU | ops | Size | Lat ms |
+|-----------|----:|----:|----:|----:|-----:|-------:|
+| cond_prefill | 0% | 100% | 0% | 550¹ | 127 MB | ~5 ms (1× @ 4.8) |
+| flowlm_step (fp16) | 0% | 100% | 0% | 556 | 145 MB | 149 ms (43× @ 3.46) |
+| flow_decoder_fused | **100%** | 0% | 0% | 1252 | 18 MB | 46 ms (42× @ 1.09) |
+| mimi_decoder | 0% | 0% | 100% | 271¹ | 41 MB | 302 ms (42× @ 7.2) |
+
+¹ `MLComputePlan` crashes on `cond_prefill` (ANE compile) and `mimi_decoder`
+(streaming state), so their device split is inferred from the runtime config
+(GPU / CPU) and the op counts are from `model.mil` (non-const ops, the same
+metric MLComputePlan reports — verified equal on the fused decoder: 1252).
+
+> v2.1 cut the per-utterance pipeline ~905 ms → ~452–520 ms (**~1.8× RTFx**),
+> device-verified end-to-end (Whisper exact). Wins: **fused flow decoder** — the
+> 8-step LSD Euler loop unrolled into one call (336→42 dispatches/utt), and the
+> fat scatter-free fp16 graph flips **0% → 100% ANE** (the single-step kernel was
+> always rejected); **cond_prefill** — whole conditioning block in one call
+> (18→1); **fp16 flowlm**. The earlier "flowlm 1.97× on ANE" claim did **not**
+> reproduce — flowlm is GPU. mimi is the remaining floor (~60% of wall-time),
+> compute-bound (not overhead-bound — an MLState micro-bench showed state
+> marshalling is only ~0.5 ms/call). Voice cloning uses the unchanged v2
+> `mimi_encoder` (repo-root, language-agnostic; still crashes
+> `MLComputePlan.load`) — not part of the v2.1 synthesis path.
+
+### Supertonic
+`VectorEstimator` runs once per denoising step (default 8) and is the heaviest stage. The **default is
+now the fixed-length int4 (L-bucketed) build** (`.aneBucketed(.int4)`): ~94% on the ANE, ~2.7× faster
+end-to-end, with 4-bit k-means palettization that is perceptually clean. The synthesizer pads each
+chunk's latent up to the smallest bucket ≥ its length (L ∈ {128, 256, 512}; 128 covers the common
+case). The legacy **fp16 dynamic** build (`--ve-variant fp16`) uses RangeDim shapes Core ML **cannot
+place on the ANE**, so it stays on CPU; the `ANECCompile() FAILED` line it emits is non-fatal noise.
+Verified M5 Pro / macOS 26.5; see [Supertonic3 docs](TTS/Supertonic3.md#vectorestimator-variants).
+
+| Component | ANE | GPU | CPU | ops | Size | Lat ms |
+|-----------|----:|----:|----:|----:|-----:|-------:|
+| TextEncoder | 98% | 0% | 2% | 308 | 18 MB | 1.2 |
+| DurationPredictor | 0% | 0% | 100% | 195 | 2 MB | 2.5 |
+| VectorEstimator (fixed L128, int4, **default**) | 94% | 0% | 6% | 679 | 33 MB | ~31 ms (8× @ 3.8)² |
+| Vocoder | 100% | 0% | 0% | 107 | 49 MB | 10.5 |
+
+² Fixed-build split + per-step latency from `MLComputePlan` + warm CPU-vs-NE timing at L128 (NE 3.8 ms
+vs CPU-only 14.2 ms/step). A cold first call additionally pays a one-time ANE compile.
+
+---
+
+
+## How to measure
+
+### Method 1: `MLComputePlan` (device split, what produced this report)
+
+`MLComputePlan` (macOS 14.4+ / iOS 17.4+) loads a compiled model and reports, per operation, the
+compute device CoreML will prefer. Counting ops by device gives the ANE/GPU/CPU split with no Xcode
+and no instrumentation. Implemented in [`Scripts/ane_profile.swift`](../Scripts/ane_profile.swift);
+the core is:
+
+```swift
+let plan = try await MLComputePlan.load(contentsOf: url, configuration: config)
+// walk plan.modelStructure (.program ops / .neuralNetwork layers / .pipeline submodels),
+// call plan.deviceUsage(for: op)?.preferred, and tally .neuralEngine / .gpu / .cpu
+```
+
+Reproduce the device split:
+
+```bash
+swiftc -O -target arm64-apple-macos14.4 Scripts/ane_profile.swift -o /tmp/ane_profile
+/tmp/ane_profile path/to/Encoder.mlmodelc                # multiple args print a TOTAL
+/tmp/ane_profile --units gpu path/to/Encoder.mlmodelc    # force a compute-unit policy
+```
+
+### Latency (one-time, real audio)
+
+The latency numbers were a **one-time measurement**: temporary env-gated timers wrapped each model's
+`prediction` call while running the real pipelines on a real benchmark clip (`transcribe`,
+`nemotron-transcribe`, `parakeet-eou`, `process --mode offline`, `tts`). That instrumentation was
+removed after measuring (not retained in the codebase). To refresh, re-add a timer around the
+prediction sites in the relevant manager and re-run.
+
+> **Warm vs cold matters a lot.** The first call to each model pays ANE compile + weight residency,
+> which can be 10-50x the warm per-call cost (Pyannote segmentation: 1293 ms cold, 55 ms warm). The
+> doc's numbers are warm (second run). Many-call stages (encoders, decode loops) amortize this;
+> few-call stages (diarization) are dominated by it, so cold start is the real cost on a fresh launch.
+
+### Method 2: Xcode Core ML Performance Report
+
+Open the `.mlpackage`/`.mlmodelc` in Xcode → **Performance** tab → **+** → pick a connected device.
+Per-layer Neural Engine / GPU / CPU breakdown on real hardware. Best for *which* layers fall off the
+ANE and for per-device numbers (iPhone ANE differs from M-series). GUI only, not automatable.
+
+### Method 3: `powermetrics` (runtime confirmation)
+
+Methods 1 and 2 show the plan; this shows what the silicon actually did:
+
+```bash
+sudo powermetrics --samplers ane_power -i 200   # watch ANE power while inference runs
+```
+
+If ANE power stays near 0 mW during transcription, the model is not really on the ANE regardless of
+config.
+
+## Gotchas that knock work off the ANE
+
+- **Small graphs (under ~50 MB)** stay on CPU by design; transfer overhead beats the speedup. Not a bug.
+- **fp16 only.** fp32 ops fall to CPU/GPU (and watch fp16 **NaN** on some encoders).
+- **Dynamic shapes / big reshapes** land on CPU; static-shape graphs stay on ANE. Cohere's v2 decoder
+  fixed its attention mask to a literal shape specifically to stay ANE-resident.
+- **`MLState` is ANE-incompatible on iOS 18** for some configs; stateful decoders can get bumped off.
+- **ANE means fast inference, slow load.** First ANE init is multi-second; a model can be 90% ANE and
+  still feel slow cold. That's load, not inference. Separate the two.
+- **GPU sometimes wins.** Parakeet v3's encoder is deliberately on GPU (+8% RTFx, WER-neutral on
+  M-series). "More ANE" is the goal for **iOS power**, not automatically for Mac throughput.
+- **Optimization hints can backfire.** `MLOptimizationHints(reshapeFrequency: .infrequent,
+  specializationStrategy: .fastPrediction)` regressed RTFx 26% on a static-shape encoder. Re-bench
+  before enabling. See `Sources/FluidAudio/Shared/MLModelConfigurationUtils.swift`.
+
+## Why convolutions map cleanly to the ANE and attention needs reformulation
+
+The gotchas above share a cause: convolutions arrive in the shape and layout the ANE compiler wants,
+and attention does not. That is why conv-heavy audio models in this repo profile at 93–100% ANE while
+transformer stacks split, fall back, or deliberately ship on GPU. It is not a ceiling on transformers —
+Apple's own ANE-optimized Transformer reaches up to 10× lower latency than the baseline graph (see
+[Deploying Transformers on the Apple Neural Engine](https://machinelearning.apple.com/research/neural-engine-transformers))
+— but that speedup is earned by rewriting the graph, and stock attention does not get it for free.
+
+**What Apple documents.** The ANE deployment guidance is explicit about four things: use a
+channels-first 4D layout (`(B, C, 1, S)`), keep intermediate tensors small enough to stay
+cache-resident (chunk large ones), avoid memory copies such as transposes and reshapes, and expect
+small-batch inference to be bandwidth-bound rather than compute-bound. A convolution satisfies all four
+as written: static shapes, channels-first activations, no layout change between layers, and a weight
+tensor that is reused at every spatial position, so arithmetic intensity is high. Kokoro's conv vocoder
+(99% ANE) and the WeSpeaker embedding (93%) are the canonical wins. Whether the silicon is literally
+weight-stationary or holds activations in local SRAM is not something Apple documents or these
+measurements can show; the documented guidance and the measured placement are enough to explain the
+splits.
+
+**Where stock attention diverges from that guidance:**
+
+- **Two activations, no weight.** `QKᵀ` and `attn×V` multiply two runtime tensors. Whatever weight
+  reuse the hardware exploits for convs does not apply, and at speech sequence lengths both matmuls sit
+  in the bandwidth-bound regime Apple calls out.
+- **Layout and transposes.** The transformer-native `(batch, seq, dim)` layout must be reformulated to
+  `(B, C, 1, S)` with projections expressed as 1×1 convs (Apple's `ane_transformers` recipe). The
+  distinction from GPU is one of graph lowering: GPU matmul libraries usually absorb a `Kᵀ` into strides
+  or fuse it into the consuming kernel, so nothing is materialized, whereas the ANE compiler treats a
+  transpose as a copy the guidance tells you to design out. A materialized transpose is data movement on
+  either device.
+- **Softmax is a reduction.** Low arithmetic intensity between two matmuls; in the bandwidth-bound
+  regime it costs time without feeding the MACs. (Whether the ANE overlaps it with matmul work is not
+  documented — treat "stalls the pipeline" as a hypothesis.)
+- **S×S grows past cache residency.** The attention matrix grows quadratically with sequence length,
+  which is exactly the intermediate tensor Apple's chunking principle targets. The sliding-window
+  encoders here bound S with static 15 s chunks and place 93–99% of ops on ANE; a longer-context or
+  unchunked graph has to chunk explicitly.
+- **Cache updates need ANE-legal ops.** A KV cache can be a fixed-shape state tensor updated in place
+  each step (Core ML's stateful-model example does exactly that), so autoregressive decode is not
+  inherently off-limits. What matters is the update op. PocketTTS's flowlm writes its cache with a
+  rank-5 `scatter`, which the ANE compiler rejects at any precision. Our Qwen3-0.6B trial showed the
+  same pattern: the prefill graph placed 1918/1919 ops on ANE while the decode graph was rejected
+  by the ANE compiler. We did not isolate the offending op, so read that as consistent with an
+  op-legality problem rather than proof of one.
+
+**Why the GPU wins those graphs today.** A RoPE transformer encoder is a stack of large dense GEMMs
+plus softmax, which GPU kernels stream at full memory bandwidth with no layout rewrite. The Parakeet v3
+encoder shipping on `.cpuAndGPU` (+8% RTFx) is this effect, not a tuning accident. The mirror image holds
+on NVIDIA hardware: tensor cores are GEMM engines, so convolutions must be lowered to implicit GEMM and
+small-channel speech convs utilize them poorly. An architecture chosen for GPU training throughput tends
+to need reformulation for the ANE, and vice versa.
+
+Practical consequence: for transformer graphs, treat the ANE as a *power/residency* play (fits in
+95–200 MB, frees the GPU, sips battery on iOS) that usually costs peak Mac throughput, and expect to
+earn residency via graph surgery — channels-first layout, static shapes, chunked intermediates,
+split graphs, ANE-legal cache updates, quantization — rather than a config flag. For conv graphs,
+the ANE is usually free performance.

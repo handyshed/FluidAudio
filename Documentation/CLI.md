@@ -7,57 +7,83 @@ This guide collects commonly used `fluidaudio` CLI commands for ASR, diarization
 TTS is built into the CLI. Run it directly:
 
 ```bash
-swift run fluidaudio tts "Hello from FluidAudio" --output out.wav
+# Default Kokoro (CPU+GPU, multi-voice, chunker, custom lexicon)
+swift run fluidaudiocli tts "Hello from FluidAudio" --output out.wav
+
+# Kokoro ANE (7-stage, ANE-resident, 3-11× RTFx, single voice af_heart)
+swift run fluidaudiocli tts "Hello from FluidAudio" \
+  --backend kokoro-ane \
+  --output out-ane.wav
+
+# PocketTTS (streaming, voice cloning)
+swift run fluidaudiocli tts "Hello from FluidAudio" \
+  --backend pocket \
+  --output out-pocket.wav
+
+# Multilingual G2P benchmark
+swift run fluidaudiocli g2p-benchmark
 ```
 
 ## ASR
 
 ```bash
 # Transcribe an audio file (batch)
-swift run fluidaudio transcribe audio.wav
+swift run fluidaudiocli transcribe audio.wav
 
 # English-only run with higher accuracy
-swift run fluidaudio transcribe audio.wav --model-version v2
+swift run fluidaudiocli transcribe audio.wav --model-version v2
+
+# Streaming ASR with Parakeet EOU
+swift run fluidaudiocli parakeet-eou --input audio.wav
 
 # Transcribe multiple files in parallel
-swift run fluidaudio multi-stream audio1.wav audio2.wav
+swift run fluidaudiocli multi-stream audio1.wav audio2.wav
 
 # Benchmark ASR on LibriSpeech
-swift run fluidaudio asr-benchmark --subset test-clean --max-files 50
+swift run fluidaudiocli asr-benchmark --subset test-clean --max-files 50
 
 # English benchmark preset (LibriSpeech)
-swift run fluidaudio asr-benchmark --subset test-clean --max-files 50 --model-version v2
+swift run fluidaudiocli asr-benchmark --subset test-clean --max-files 50 --model-version v2
 
 # Multilingual ASR (FLEURS) benchmark
-swift run fluidaudio fleurs-benchmark --languages en_us,fr_fr --samples 10
+swift run fluidaudiocli fleurs-benchmark --languages en_us,fr_fr --samples 10
+
+# CTC keyword spotting benchmark on Earnings22
+swift run fluidaudiocli ctc-earnings-benchmark
 ```
 
 ## Diarization
 
 ```bash
 # Run AMI benchmark (auto-download dataset)
-swift run fluidaudio diarization-benchmark --auto-download
+swift run fluidaudiocli diarization-benchmark --auto-download
 
 # Tune threshold and save results
-swift run fluidaudio diarization-benchmark --threshold 0.7 --output results.json
+swift run fluidaudiocli diarization-benchmark --threshold 0.7 --output results.json
 
 # Quick test on a single AMI file
-swift run fluidaudio diarization-benchmark --single-file ES2004a --threshold 0.8
+swift run fluidaudiocli diarization-benchmark --single-file ES2004a --threshold 0.8
 
 # Real-time-ish streaming benchmark (~3s chunks with 2s overlap)
-swift run fluidaudio diarization-benchmark --single-file ES2004a \
+swift run fluidaudiocli diarization-benchmark --single-file ES2004a \
   --chunk-seconds 3 --overlap-seconds 2
 
 # Balanced throughput/quality (~10s chunks with 5s overlap)
-swift run fluidaudio diarization-benchmark --dataset ami-sdm \
+swift run fluidaudiocli diarization-benchmark --dataset ami-sdm \
   --chunk-seconds 10 --overlap-seconds 5
 
 # Run the full VBx offline pipeline
-swift run fluidaudio diarization-benchmark --mode offline --dataset ami-sdm --threshold 0.6
+swift run fluidaudiocli diarization-benchmark --mode offline --dataset ami-sdm --threshold 0.6
 
 # Process a single file with streaming vs. offline inference
-swift run fluidaudio process meeting.wav --mode streaming --threshold 0.7
-swift run fluidaudio process meeting.wav --mode offline --threshold 0.6 --debug
+swift run fluidaudiocli process meeting.wav --mode streaming --threshold 0.7
+swift run fluidaudiocli process meeting.wav --mode offline --threshold 0.6 --debug
+
+# Sortformer streaming diarization
+swift run fluidaudiocli sortformer audio.wav
+
+# Sortformer benchmark on AMI dataset
+swift run fluidaudiocli sortformer-benchmark
 ```
 
 - `--mode offline` switches the CLI to `OfflineDiarizerManager`, running the full VBx pipeline with PLDA refinement. Expect DER ≈ 18–20 % on AMI-SDM with threshold 0.6.
@@ -68,27 +94,53 @@ swift run fluidaudio process meeting.wav --mode offline --threshold 0.6 --debug
 
 ```bash
 # Offline segmentation with seconds output (default mode)
-swift run fluidaudio vad-analyze path/to/audio.wav
+swift run fluidaudiocli vad-analyze path/to/audio.wav
 
 # Streaming only with 128 ms chunks and a custom threshold (timestamps emitted in seconds)
-swift run fluidaudio vad-analyze path/to/audio.wav --streaming --threshold 0.65 --min-silence-ms 400
+swift run fluidaudiocli vad-analyze path/to/audio.wav --streaming --threshold 0.65 --min-silence-ms 400
 
 # Run VAD benchmark (mini50 dataset by default)
-swift run fluidaudio vad-benchmark --num-files 50 --threshold 0.3
+swift run fluidaudiocli vad-benchmark --num-files 50 --threshold 0.3
 
 # Save benchmark results and enable debug output
-swift run fluidaudio vad-benchmark --all-files --output vad_results.json --debug
+swift run fluidaudiocli vad-benchmark --all-files --output vad_results.json --debug
 ```
 
-`swift run fluidaudio vad-analyze --help` lists every tuning option (padding,
+`swift run fluidaudiocli vad-analyze --help` lists every tuning option (padding,
 negative threshold overrides, max-duration splitting, etc.).
+
+## Speech Enhancement (LocalVQE)
+
+```bash
+# Echo cancellation + noise suppression: mic capture plus what the speaker played
+swift run -c release fluidaudiocli enhance mic.wav --reference speaker.wav --output clean.wav
+
+# Noise suppression / dereverb only (silent far end)
+swift run -c release fluidaudiocli enhance mic.wav --output clean.wav
+
+# Drive the streaming API in 256-sample buffers with the 16 ms export and report per-call latency
+swift run -c release fluidaudiocli enhance mic.wav -r speaker.wav --chunk 16ms --streaming --buffer-samples 256
+```
+
+`--variant v1.2` selects the 1.3M-param checkpoint, `--compute-units gpu`
+moves the model off the CPU, and `--model-dir DIR` loads local `.mlmodelc`
+bundles instead of downloading.
+
+```bash
+# Near-end word recall / WER / far-end leakage on the AEC-Challenge synthetic mini set (auto-downloads)
+swift run -c release fluidaudiocli enhance-benchmark
+swift run -c release fluidaudiocli enhance-benchmark --max-files 50 --variants v1.3 --no-reference --output results.json
+# Split the run across machines: contiguous shard i of n, then merge + verify the shard reports
+swift run -c release fluidaudiocli enhance-benchmark --shard 0/5 --output shard0.json
+python3 Scripts/verify_localvqe_benchmark.py shard*.json --merged results.json --expected-files 200
+```
 
 ## Datasets
 
 ```bash
 # Download test sets
-swift run fluidaudio download --dataset librispeech-test-clean
-swift run fluidaudio download --dataset librispeech-test-other
-swift run fluidaudio download --dataset ami-sdm
-swift run fluidaudio download --dataset vad
+swift run fluidaudiocli download --dataset librispeech-test-clean
+swift run fluidaudiocli download --dataset librispeech-test-other
+swift run fluidaudiocli download --dataset ami-sdm
+swift run fluidaudiocli download --dataset vad
 ```

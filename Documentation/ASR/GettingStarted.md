@@ -10,7 +10,7 @@
 
 ## Streaming ASR (Parakeet EOU)
 
-- Model: `FluidInference/parakeet-eou-1.1b-coreml`
+- Model: `FluidInference/parakeet-realtime-eou-120m-coreml`
 - Chunk Sizes: 160ms (lowest latency), 320ms, 1600ms (highest throughput)
 - End-of-Utterance Detection: Built-in silence detection with configurable debounce
 
@@ -18,6 +18,9 @@
 
 - Prefer **v2** when you only need English. It reuses the fused TDT decoder from v3 but ships with a tighter vocabulary, delivering better recall on long-form English audio.
 - Use **v3** for multilingual coverage (25 languages). English accuracy is still strong, but the broader vocab slightly trails v2 on rare words.
+- Prefer **ultra** over v3 for new work: same languages and API, more accurate on English and on all 24 FLEURS languages we measure, same speed. See [ParakeetUltra.md](ParakeetUltra.md).
+- Use **redux** when download size matters most (~220 MB vs ~480 MB for v3). iOS 18+ / macOS 15+ only. See [ParakeetRedux.md](ParakeetRedux.md).
+- Use **phonon2** for English-only apps on iOS 18+ / macOS 15+: Fermion Research's five-value re-training of v3, with the fastest Neural Engine encoder we ship and a 253 MB GPU encoder option. See [Phonon2.md](Phonon2.md).
 - Both versions share the same API surface—set `AsrModelVersion` in code or pass `--model-version` in the CLI.
 
 ```swift
@@ -35,7 +38,7 @@ Task {
     // 1) Initialize ASR manager and load models
     let models = try await AsrModels.downloadAndLoad(version: .v3)  // Switch to .v2 for English-only
     let asrManager = AsrManager(config: .default)
-    try await asrManager.initialize(models: models)
+    try await asrManager.configure(models: models)
 
     // 2) Prepare 16 kHz mono samples (see: Audio Conversion)
     let samples = try await loadSamples16kMono(path: "path/to/audio.wav")
@@ -60,7 +63,7 @@ handles format conversion internally via `AudioConverter`.
 ```swift
 let models = try await AsrModels.downloadAndLoad(version: .v3)
 let asrManager = AsrManager()
-try await asrManager.initialize(models: models)
+try await asrManager.loadModels(models)
 
 let audioURL = URL(fileURLWithPath: "/path/to/audio.wav")
 let result = try await asrManager.transcribe(audioURL, source: .system)
@@ -75,36 +78,36 @@ Working offline? Follow the [Manual Model Loading guide](ManualModelLoading.md) 
 
 ```bash
 # Transcribe an audio file (batch)
-swift run fluidaudio transcribe audio.wav
+swift run fluidaudiocli transcribe audio.wav
 
 # English-only run (better recall)
-swift run fluidaudio transcribe audio.wav --model-version v2
+swift run fluidaudiocli transcribe audio.wav --model-version v2
 
 # Transcribe multiple files in parallel
-swift run fluidaudio multi-stream audio1.wav audio2.wav
+swift run fluidaudiocli multi-stream audio1.wav audio2.wav
 
 # Benchmark ASR on LibriSpeech
-swift run fluidaudio asr-benchmark --subset test-clean --max-files 50
+swift run fluidaudiocli asr-benchmark --subset test-clean --max-files 50
 
 # Run the English-only benchmark
-swift run fluidaudio asr-benchmark --subset test-clean --max-files 50 --model-version v2
+swift run fluidaudiocli asr-benchmark --subset test-clean --max-files 50 --model-version v2
 
 # Multilingual ASR (FLEURS) benchmark
-swift run fluidaudio fleurs-benchmark --languages en_us,fr_fr --samples 10
+swift run fluidaudiocli fleurs-benchmark --languages en_us,fr_fr --samples 10
 
 # Download LibriSpeech test sets
-swift run fluidaudio download --dataset librispeech-test-clean
-swift run fluidaudio download --dataset librispeech-test-other
+swift run fluidaudiocli download --dataset librispeech-test-clean
+swift run fluidaudiocli download --dataset librispeech-test-other
 ```
 
 ## Streaming CLI (Parakeet EOU)
 
 ```bash
 # Transcribe a file (--use-cache auto-downloads models)
-swift run fluidaudio parakeet-eou --input audio.wav --use-cache
+swift run fluidaudiocli parakeet-eou --input audio.wav --use-cache
 
 # Run benchmark on LibriSpeech test-clean
-swift run fluidaudio parakeet-eou --benchmark --chunk-size 160 --max-files 100 --use-cache
+swift run fluidaudiocli parakeet-eou --benchmark --chunk-size 160 --max-files 100 --use-cache
 ```
 
 **Options:** `--input <path>`, `--benchmark`, `--max-files <n>`, `--chunk-size <160|320|1600>`, `--eou-debounce <ms>`, `--use-cache`, `--models <path>`, `--output <path>`, `--verbose`

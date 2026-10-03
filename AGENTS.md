@@ -25,12 +25,12 @@ swift format --in-place --recursive --configuration .swift-format Sources/ Tests
 - **NEVER** create dummy/mock models or synthetic audio data - use real models only
 - **NEVER** create simplified versions - implement full solutions or consult first
 - **NEVER** run `git push` unless explicitly requested by user
-- **ONLY** add or run tests when explicitly requested by the user
+- Add unit tests when writing new code
 
 ## Code Style (swift-format config)
 
 - Line length: 120 chars, 4-space indentation
-- Import order: `import CoreML`, `import Foundation`, `import OSLog` (OrderedImports rule)
+- Import order: Alphabetical preferred (`import CoreML`, `import Foundation`, `import OSLog`), but OrderedImports rule is disabled due to Swift 6.1 (GitHub Actions CI) vs 6.3 (local) formatter incompatibility
 - Naming: lowerCamelCase for variables/functions, UpperCamelCase for types
 - Error handling: Use proper Swift error handling, no force unwrapping in production
 - Documentation: Triple-slash comments (`///`) for public APIs
