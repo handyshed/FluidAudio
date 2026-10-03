@@ -368,6 +368,19 @@ public actor NemotronStreamingAsrManager {
         return ""
     }
 
+    /// Finish after the caller has processed a full trailing-silence chunk.
+    /// Skips only an entirely zero-valued remainder; ordinary finish() is unchanged.
+    /// Stop feeding speech and await all pending audio processing before calling this method.
+    /// Callers that have not successfully processed trailing silence must use finish().
+    public func finishSkippingSilentRemainder() async throws -> (
+        text: String, confidences: [Float], alternatives: [[TokenCandidate]], timestamps: [Int]
+    ) {
+        if audioBuffer.allSatisfy({ $0 == 0 }) {
+            audioBuffer.removeAll()
+        }
+        return try await finish()
+    }
+
     /// Finish processing and return final transcript with per-token confidences.
     /// Each confidence is the softmax probability of the chosen token from the joint network logits.
     public func finish() async throws -> (text: String, confidences: [Float], alternatives: [[TokenCandidate]], timestamps: [Int]) {
