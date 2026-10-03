@@ -40,7 +40,7 @@ extension DiarizerModels {
     public static func download(
         to directory: URL? = nil,
         configuration: MLModelConfiguration? = nil,
-        progressHandler: DownloadUtils.ProgressHandler? = nil
+        progressHandler: ProgressHandler? = nil
     ) async throws -> DiarizerModels {
         let logger = AppLogger(category: "DiarizerModels")
         logger.info("Checking for diarizer models...")
@@ -53,7 +53,7 @@ extension DiarizerModels {
         let segmentationModelName = ModelNames.Diarizer.segmentationFile
         let embeddingModelName = ModelNames.Diarizer.embeddingFile
 
-        let models = try await DownloadUtils.loadModels(
+        let models = try await ModelHub.loadModels(
             .diarizer,
             modelNames: Array(requiredModelNames),
             directory: directory.deletingLastPathComponent(),
@@ -83,7 +83,7 @@ extension DiarizerModels {
     public static func load(
         from directory: URL? = nil,
         configuration: MLModelConfiguration? = nil,
-        progressHandler: DownloadUtils.ProgressHandler? = nil
+        progressHandler: ProgressHandler? = nil
     ) async throws -> DiarizerModels {
         let directory = directory ?? defaultModelsDirectory()
         return try await download(to: directory, configuration: configuration, progressHandler: progressHandler)
@@ -92,27 +92,18 @@ extension DiarizerModels {
     public static func downloadIfNeeded(
         to directory: URL? = nil,
         configuration: MLModelConfiguration? = nil,
-        progressHandler: DownloadUtils.ProgressHandler? = nil
+        progressHandler: ProgressHandler? = nil
     ) async throws -> DiarizerModels {
         return try await download(to: directory, configuration: configuration, progressHandler: progressHandler)
     }
 
     public static func defaultModelsDirectory() -> URL {
-        let applicationSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return
-            applicationSupport
-            .appendingPathComponent("FluidAudio", isDirectory: true)
-            .appendingPathComponent("Models", isDirectory: true)
-            .appendingPathComponent(Repo.diarizer.folderName, isDirectory: true)
+        MLModelConfigurationUtils.defaultModelsDirectory(for: .diarizer)
     }
 
     static func defaultConfiguration() -> MLModelConfiguration {
-        let config = MLModelConfiguration()
-        // Enable Float16 optimization for ~2x speedup
-        config.allowLowPrecisionAccumulationOnGPU = true
         let isCI = ProcessInfo.processInfo.environment["CI"] != nil
-        config.computeUnits = isCI ? .cpuAndNeuralEngine : .all
-        return config
+        return MLModelConfigurationUtils.defaultConfiguration(computeUnits: isCI ? .cpuAndNeuralEngine : .all)
     }
 }
 
@@ -130,7 +121,7 @@ extension DiarizerModels {
         localSegmentationModel: URL,
         localEmbeddingModel: URL,
         configuration: MLModelConfiguration? = nil
-    ) async throws -> DiarizerModels {
+    ) throws -> DiarizerModels {
 
         let logger = AppLogger(category: "DiarizerModels")
         logger.info("Loading predownloaded models")

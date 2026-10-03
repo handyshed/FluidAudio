@@ -10,7 +10,7 @@
 
 ## Streaming ASR (Parakeet EOU)
 
-- Model: `FluidInference/parakeet-eou-1.1b-coreml`
+- Model: `FluidInference/parakeet-realtime-eou-120m-coreml`
 - Chunk Sizes: 160ms (lowest latency), 320ms, 1600ms (highest throughput)
 - End-of-Utterance Detection: Built-in silence detection with configurable debounce
 
@@ -18,6 +18,9 @@
 
 - Prefer **v2** when you only need English. It reuses the fused TDT decoder from v3 but ships with a tighter vocabulary, delivering better recall on long-form English audio.
 - Use **v3** for multilingual coverage (25 languages). English accuracy is still strong, but the broader vocab slightly trails v2 on rare words.
+- Prefer **ultra** over v3 for new work: same languages and API, more accurate on English and on all 24 FLEURS languages we measure, same speed. See [ParakeetUltra.md](ParakeetUltra.md).
+- Use **redux** when download size matters most (~220 MB vs ~480 MB for v3). iOS 18+ / macOS 15+ only. See [ParakeetRedux.md](ParakeetRedux.md).
+- Use **phonon2** for English-only apps on iOS 18+ / macOS 15+: Fermion Research's five-value re-training of v3, with the fastest Neural Engine encoder we ship and a 253 MB GPU encoder option. See [Phonon2.md](Phonon2.md).
 - Both versions share the same API surface—set `AsrModelVersion` in code or pass `--model-version` in the CLI.
 
 ```swift
@@ -35,7 +38,7 @@ Task {
     // 1) Initialize ASR manager and load models
     let models = try await AsrModels.downloadAndLoad(version: .v3)  // Switch to .v2 for English-only
     let asrManager = AsrManager(config: .default)
-    try await asrManager.initialize(models: models)
+    try await asrManager.configure(models: models)
 
     // 2) Prepare 16 kHz mono samples (see: Audio Conversion)
     let samples = try await loadSamples16kMono(path: "path/to/audio.wav")
@@ -60,7 +63,7 @@ handles format conversion internally via `AudioConverter`.
 ```swift
 let models = try await AsrModels.downloadAndLoad(version: .v3)
 let asrManager = AsrManager()
-try await asrManager.initialize(models: models)
+try await asrManager.loadModels(models)
 
 let audioURL = URL(fileURLWithPath: "/path/to/audio.wav")
 let result = try await asrManager.transcribe(audioURL, source: .system)

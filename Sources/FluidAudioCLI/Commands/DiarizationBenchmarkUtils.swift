@@ -5,9 +5,27 @@ import Foundation
 /// Shared utilities for diarization benchmark commands (LS-EEND and Sortformer).
 enum DiarizationBenchmarkUtils {
 
+    enum AMISplit: String {
+        case train
+        case dev
+        case test
+    }
+
     /// Dataset corpora supported by diarization benchmarks.
+    ///
+    /// Card-protocol conditions (NVIDIA Nemotron 3 model card):
+    /// `ami` = AMI test MHM (Mix-Headset), `amiSdm` = AMI test SDM (Array1-01),
+    /// `alimeetingFar` = channel 0 of the far-field array, `alimeetingNear` =
+    /// equal-weight mix of per-speaker headset channels (both pre-materialized by
+    /// `Scripts/materialize_alimeeting_card_audio.py`), `notsofarMhm`/`notsofarSc` =
+    /// NOTSOFAR1 eval mixes (see `Scripts/materialize_notsofar_card_audio.py`).
     enum Dataset: String {
         case ami = "ami"
+        case amiSdm = "ami-sdm"
+        case alimeetingFar = "alimeeting-far"
+        case alimeetingNear = "alimeeting-near"
+        case notsofarMhm = "notsofar-mhm"
+        case notsofarSc = "notsofar-sc"
         case voxconverse = "voxconverse"
         case callhome = "callhome"
     }
@@ -30,17 +48,12 @@ enum DiarizationBenchmarkUtils {
 
     // MARK: - File Paths
 
-    static func getAMIFiles(maxFiles: Int?) -> [String] {
-        let allMeetings = [
-            "EN2002a", "EN2002b", "EN2002c", "EN2002d",
-            "ES2004a", "ES2004b", "ES2004c", "ES2004d",
-            "IS1009a", "IS1009b", "IS1009c", "IS1009d",
-            "TS3003a", "TS3003b", "TS3003c", "TS3003d",
-        ]
+    static func getAMIFiles(split: AMISplit = .test, dataset: Dataset = .ami, maxFiles: Int?) -> [String] {
+        let allMeetings = getAMIMeetings(split: split)
 
         var availableMeetings: [String] = []
-        for meeting in allMeetings {
-            let path = getAudioPath(for: meeting, dataset: .ami)
+        for meeting in DatasetDownloader.officialAMITestSet {
+            let path = getAudioPath(for: meeting, dataset: dataset)
             if FileManager.default.fileExists(atPath: path) {
                 availableMeetings.append(meeting)
             }
@@ -52,12 +65,104 @@ enum DiarizationBenchmarkUtils {
         return availableMeetings
     }
 
+    /// Enumerates meetings for datasets whose audio lives in a flat directory of
+    /// `<meeting>.wav` files with a matching reference RTTM per meeting.
+    static func getDirectoryFiles(dataset: Dataset, maxFiles: Int?) -> [String] {
+        let sampleAudioPath = getAudioPath(for: "PROBE", dataset: dataset)
+        let audioDir = URL(fileURLWithPath: sampleAudioPath).deletingLastPathComponent()
+
+        guard
+            let files = try? FileManager.default.contentsOfDirectory(
+                at: audioDir, includingPropertiesForKeys: nil)
+        else {
+            return []
+        }
+
+        var availableMeetings: [String] = []
+        for file in files where file.pathExtension == "wav" {
+            let name = file.deletingPathExtension().lastPathComponent
+            if let rttmURL = getRTTMURL(for: name, dataset: dataset),
+                FileManager.default.fileExists(atPath: rttmURL.path)
+            {
+                availableMeetings.append(name)
+            }
+        }
+
+        availableMeetings.sort()
+        if let max = maxFiles {
+            return Array(availableMeetings.prefix(max))
+        }
+        return availableMeetings
+    }
+
+    static func getAMIMeetings(split: AMISplit) -> [String] {
+        switch split {
+        case .train:
+            return [
+                "EN2001a", "EN2001d", "EN2001e", "EN2002a", "EN2002b", "EN2002c", "EN2002d",
+                "EN2003a", "EN2004a", "EN2005a", "EN2006a", "EN2006b", "EN2009b", "EN2009c",
+                "EN2009d", "ES2002a", "ES2002b", "ES2002c", "ES2002d", "ES2003a", "ES2003b",
+                "ES2003c", "ES2003d", "ES2005a", "ES2005b", "ES2005c", "ES2005d", "ES2006a",
+                "ES2006b", "ES2006c", "ES2006d", "ES2007a", "ES2007b", "ES2007c", "ES2007d",
+                "ES2008a", "ES2008b", "ES2008c", "ES2008d", "ES2009a", "ES2009b", "ES2009c",
+                "ES2009d", "ES2010a", "ES2010b", "ES2010c", "ES2010d", "ES2012a", "ES2012b",
+                "ES2012c", "ES2012d", "ES2013a", "ES2013b", "ES2013c", "ES2013d", "ES2014a",
+                "ES2014b", "ES2014c", "ES2014d", "ES2015a", "ES2015b", "ES2015c", "ES2015d",
+                "ES2016a", "ES2016b", "ES2016c", "ES2016d", "IB4005", "IN1001", "IN1002",
+                "IN1005", "IN1007", "IN1008", "IN1009", "IN1012", "IN1013", "IN1014", "IN1016",
+                "IS1000a", "IS1000b", "IS1000c", "IS1000d", "IS1001a", "IS1001b", "IS1001c",
+                "IS1001d", "IS1002b", "IS1002c", "IS1002d", "IS1003a", "IS1003b", "IS1003c",
+                "IS1003d", "IS1004a", "IS1004b", "IS1004c", "IS1004d", "IS1005a", "IS1005b",
+                "IS1005c", "IS1006a", "IS1006b", "IS1006c", "IS1006d", "IS1007a", "IS1007b",
+                "IS1007c", "IS1007d", "TS3005a", "TS3005b", "TS3005c", "TS3005d", "TS3006a",
+                "TS3006b", "TS3006c", "TS3006d", "TS3007a", "TS3007b", "TS3007c", "TS3007d",
+                "TS3008a", "TS3008b", "TS3008c", "TS3008d", "TS3009a", "TS3009b", "TS3009c",
+                "TS3009d", "TS3010a", "TS3010b", "TS3010c", "TS3010d", "TS3011a", "TS3011b",
+                "TS3011c", "TS3011d", "TS3012a", "TS3012b", "TS3012c", "TS3012d",
+            ]
+        case .dev:
+            return [
+                "ES2011a", "ES2011b", "ES2011c", "ES2011d",
+                "IB4001", "IB4002", "IB4003", "IB4004", "IB4010", "IB4011",
+                "IS1008a", "IS1008b", "IS1008c", "IS1008d",
+                "TS3004a", "TS3004b", "TS3004c", "TS3004d",
+            ]
+        case .test:
+            return [
+                "EN2002a", "EN2002b", "EN2002c", "EN2002d",
+                "ES2004a", "ES2004b", "ES2004c", "ES2004d",
+                "IS1009a", "IS1009b", "IS1009c", "IS1009d",
+                "TS3003a", "TS3003b", "TS3003c", "TS3003d",
+            ]
+        }
+    }
+
     static func getAudioPath(for meeting: String, dataset: Dataset) -> String {
         let homeDir = FileManager.default.homeDirectoryForCurrentUser
         switch dataset {
         case .ami:
             return homeDir.appendingPathComponent(
                 "FluidAudioDatasets/ami_official/sdm/\(meeting).Mix-Headset.wav"
+            ).path
+        case .amiSdm:
+            return homeDir.appendingPathComponent(
+                "FluidAudioDatasets/ami_official/sdm_true/\(meeting).Array1-01.wav"
+            ).path
+        case .alimeetingFar:
+            return homeDir.appendingPathComponent(
+                "FluidAudioDatasets/alimeeting/card/far_ch0/\(meeting).wav"
+            ).path
+        case .alimeetingNear:
+            return homeDir.appendingPathComponent(
+                "FluidAudioDatasets/alimeeting/card/near_mix/\(meeting).wav"
+            ).path
+        case .notsofarMhm:
+            return homeDir.appendingPathComponent(
+                "FluidAudioDatasets/notsofar/card/eval_mhm/\(meeting).wav"
+            ).path
+        case .notsofarSc:
+            return homeDir.appendingPathComponent(
+                "FluidAudioDatasets/notsofar/card/eval_sc/\(meeting).wav"
             ).path
         case .voxconverse:
             return homeDir.appendingPathComponent(
@@ -73,9 +178,19 @@ enum DiarizationBenchmarkUtils {
     static func getRTTMURL(for meeting: String, dataset: Dataset) -> URL? {
         let homeDir = FileManager.default.homeDirectoryForCurrentUser
         switch dataset {
-        case .ami:
+        case .ami, .amiSdm:
+            // MHM and SDM share the same forced-alignment references; only the
+            // audio condition differs.
+            return getAMIRTTMURL(for: meeting)
+        case .alimeetingFar, .alimeetingNear:
+            // nttcslab-sp/diar-forced-alignment publishes one reference set per
+            // meeting (Test_Ali_far); Near/Far are the same meetings.
             return homeDir.appendingPathComponent(
-                "FluidAudioDatasets/ami_official/rttm/\(meeting).rttm"
+                "FluidAudioDatasets/diar-forced-alignment/AliMeeting/Test_Ali_far/\(meeting).rttm"
+            )
+        case .notsofarMhm, .notsofarSc:
+            return homeDir.appendingPathComponent(
+                "FluidAudioDatasets/notsofar/card/rttm/\(meeting).rttm"
             )
         case .voxconverse:
             return homeDir.appendingPathComponent(
@@ -86,6 +201,38 @@ enum DiarizationBenchmarkUtils {
                 "FluidAudioDatasets/callhome_eng/rttm/\(meeting).rttm"
             )
         }
+    }
+
+    static func getAMIRTTMURL(for meeting: String) -> URL? {
+        let fileManager = FileManager.default
+        let homeDir = fileManager.homeDirectoryForCurrentUser
+        let workingDir = URL(fileURLWithPath: fileManager.currentDirectoryPath)
+        return getAMIRTTMURL(
+            for: meeting,
+            workingDir: workingDir,
+            homeDir: homeDir,
+            fileManager: fileManager
+        )
+    }
+
+    static func getAMIRTTMURL(
+        for meeting: String,
+        workingDir: URL,
+        homeDir: URL,
+        fileManager: FileManager = .default
+    ) -> URL? {
+        let candidateURLs = [
+            homeDir.appendingPathComponent("FluidAudioDatasets/ami_official/rttm/\(meeting).rttm"),
+            workingDir.appendingPathComponent("Datasets/diar-forced-alignment/AMI/test/\(meeting).rttm"),
+            workingDir.appendingPathComponent("Datasets/diar-forced-alignment/AMI/dev/\(meeting).rttm"),
+            workingDir.appendingPathComponent("Datasets/diar-forced-alignment/AMI/train/\(meeting).rttm"),
+        ]
+
+        for candidateURL in candidateURLs where fileManager.fileExists(atPath: candidateURL.path) {
+            return candidateURL
+        }
+
+        return candidateURLs.first
     }
 
     static func getVoxConverseFiles(maxFiles: Int?) -> [String] {
@@ -153,8 +300,10 @@ enum DiarizationBenchmarkUtils {
     /// Returns files for the given dataset, filtering by availability.
     static func getFiles(for dataset: Dataset, maxFiles: Int?) -> [String] {
         switch dataset {
-        case .ami:
-            return getAMIFiles(maxFiles: maxFiles)
+        case .ami, .amiSdm:
+            return getAMIFiles(dataset: dataset, maxFiles: maxFiles)
+        case .alimeetingFar, .alimeetingNear, .notsofarMhm, .notsofarSc:
+            return getDirectoryFiles(dataset: dataset, maxFiles: maxFiles)
         case .voxconverse:
             return getVoxConverseFiles(maxFiles: maxFiles)
         case .callhome:
@@ -163,6 +312,18 @@ enum DiarizationBenchmarkUtils {
     }
 
     // MARK: - Summary & Output
+
+    /// Speaker-counting metrics as defined on the NVIDIA Nemotron 3 model card:
+    /// SCA = percentage of files where predicted speaker count equals ground truth;
+    /// MAE = mean of `|predicted - ground truth|` over files.
+    static func speakerCountMetrics(results: [BenchmarkResult]) -> (sca: Double, mae: Double) {
+        guard !results.isEmpty else { return (0, 0) }
+        let exact = results.filter { $0.detectedSpeakers == $0.groundTruthSpeakers }.count
+        let absErrors = results.map { abs($0.detectedSpeakers - $0.groundTruthSpeakers) }
+        let sca = Double(exact) / Double(results.count) * 100
+        let mae = Double(absErrors.reduce(0, +)) / Double(results.count)
+        return (sca, mae)
+    }
 
     /// Prints a formatted benchmark summary table.
     ///

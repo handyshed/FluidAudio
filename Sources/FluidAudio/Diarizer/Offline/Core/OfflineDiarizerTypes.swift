@@ -73,30 +73,56 @@ public struct OfflineDiarizerConfig: Sendable {
         }
     }
 
+    /// Strategy for skipping redundant embedding extractions in the offline pipeline.
+    ///
+    /// With overlapping segmentation windows (e.g., step ratio 0.15 = 85% overlap),
+    /// consecutive windows produce nearly identical speaker masks for stable speech regions.
+    /// Skipping the embedding model call for these redundant windows saves significant compute
+    /// (the embedding model is the pipeline bottleneck at ~6.5ms per call on ANE).
+    public enum EmbeddingSkipStrategy: Sendable {
+        /// No skipping — extract every embedding (default).
+        case none
+        /// Skip if the speaker mask has cosine similarity ≥ threshold compared to the mask
+        /// that produced the currently cached embedding for this speaker. Prevents drift by
+        /// always comparing against the mask that generated the cached embedding, not a
+        /// rolling previous mask.
+        ///
+        /// Recommended threshold: 0.95 (≤1pp DER cost across VoxConverse/SCOTUS/Earnings-21).
+        case maskSimilarity(threshold: Float)
+    }
+
     public struct Embedding: Sendable {
         public var batchSize: Int
         public var excludeOverlap: Bool
         public var minSegmentDurationSeconds: Double
+        public var skipStrategy: EmbeddingSkipStrategy
 
         public static let community = Embedding(
             batchSize: 32,
             excludeOverlap: true,
-            minSegmentDurationSeconds: 1.0
+            minSegmentDurationSeconds: 1.0,
+            skipStrategy: .none
         )
 
         public init(
             batchSize: Int,
             excludeOverlap: Bool,
-            minSegmentDurationSeconds: Double
+            minSegmentDurationSeconds: Double,
+            skipStrategy: EmbeddingSkipStrategy = .none
         ) {
             self.batchSize = batchSize
             self.excludeOverlap = excludeOverlap
             self.minSegmentDurationSeconds = minSegmentDurationSeconds
+            self.skipStrategy = skipStrategy
         }
     }
 
     public struct Clustering: Sendable {
-        /// Euclidean distance threshold for unit-normalized embeddings.
+        /// Euclidean distance threshold for unit-normalized embeddings, in [0, 2].
+        ///
+        /// Applied directly as the AHC dendrogram cut distance (pyannote parity):
+        /// embeddings closer than this merge into one cluster, so **larger values
+        /// merge more aggressively and yield fewer speakers**.
         public var threshold: Double
 
         /// VBx warm-start parameters (Fa controls precision, Fb controls recall)
@@ -104,13 +130,27 @@ public struct OfflineDiarizerConfig: Sendable {
         public var warmStartFb: Double
 
         /// Minimum number of speakers. Ignored if `numSpeakers` is set.
+        ///
+        /// Only binds when the auto-detected count falls below it; it cannot
+        /// change a partition whose count already satisfies the bound.
         public var minSpeakers: Int?
 
         /// Maximum number of speakers. Ignored if `numSpeakers` is set.
         public var maxSpeakers: Int?
 
         /// Exact number of speakers. Overrides `minSpeakers` and `maxSpeakers` when set.
+        ///
+        /// Treated as a target, not a guarantee: when it differs from the
+        /// auto-detected count, embeddings are re-clustered with K-Means to this
+        /// count, but downstream assignment may leave some clusters unused.
         public var numSpeakers: Int?
+
+        /// When true (pyannote parity), local speakers sharing a segmentation
+        /// chunk are assigned to distinct clusters instead of each snapping to
+        /// its nearest centroid independently. Automatically disabled when the
+        /// speaker count is forced via `numSpeakers`/`minSpeakers`/`maxSpeakers`
+        /// re-clustering.
+        public var constrainedAssignment: Bool
 
         public static let community = Clustering(
             threshold: 0.6,
@@ -118,7 +158,8 @@ public struct OfflineDiarizerConfig: Sendable {
             warmStartFb: 0.8,
             minSpeakers: nil,
             maxSpeakers: nil,
-            numSpeakers: nil
+            numSpeakers: nil,
+            constrainedAssignment: true
         )
 
         public init(
@@ -127,7 +168,8 @@ public struct OfflineDiarizerConfig: Sendable {
             warmStartFb: Double,
             minSpeakers: Int? = nil,
             maxSpeakers: Int? = nil,
-            numSpeakers: Int? = nil
+            numSpeakers: Int? = nil,
+            constrainedAssignment: Bool = true
         ) {
             self.threshold = threshold
             self.warmStartFa = warmStartFa
@@ -135,6 +177,7 @@ public struct OfflineDiarizerConfig: Sendable {
             self.minSpeakers = minSpeakers
             self.maxSpeakers = maxSpeakers
             self.numSpeakers = numSpeakers
+            self.constrainedAssignment = constrainedAssignment
         }
     }
 
@@ -177,6 +220,32 @@ public struct OfflineDiarizerConfig: Sendable {
         }
     }
 
+    /// Optional post-pass that re-embeds aggregated timeline spans whose per-cluster vote
+    /// sums are all zero and assigns them to the closest speaker centroid.
+    ///
+    /// A frame ends up with zero votes when the active local speaker slot received no
+    /// embedding in any covering window (assignment −2 everywhere). Reconstruction would
+    /// otherwise tie-break such frames arbitrarily to cluster 0, silently absorbing whole
+    /// speaker turns into the surrounding speaker's segment. Since zero votes means there
+    /// is no incumbent evidence at all, the re-embedded span is assigned to the best
+    /// centroid regardless of margin.
+    public struct ZeroVoteReembed: Sendable {
+        /// Whether the post-pass runs. `false` by default — upstream behavior unchanged.
+        public var enabled: Bool
+
+        /// Minimum duration (seconds) of a contiguous zero-vote run eligible for re-embed.
+        /// Shorter runs keep the existing tie-break behavior.
+        public var minDurationSeconds: Double
+
+        /// Post-pass disabled (FluidAudio default).
+        public static let disabled = ZeroVoteReembed()
+
+        public init(enabled: Bool = false, minDurationSeconds: Double = 0.4) {
+            self.enabled = enabled
+            self.minDurationSeconds = minDurationSeconds
+        }
+    }
+
     public struct Export: Sendable {
         public var embeddingsPath: String?
 
@@ -192,7 +261,14 @@ public struct OfflineDiarizerConfig: Sendable {
     public var clustering: Clustering
     public var vbx: VBx
     public var postProcessing: PostProcessing
+    public var zeroVoteReembed: ZeroVoteReembed
     public var export: Export
+
+    /// When true, populate `DiarizationResult.chunkEmbeddings` with per-chunk
+    /// speaker embeddings + cluster assignments. Off by default to avoid the
+    /// extra memory footprint (~1–2 MB per hour of audio for the embedding +
+    /// PLDA payload) for callers that don't need them.
+    public var exposeChunkEmbeddings: Bool
 
     public init(
         segmentation: Segmentation = .community,
@@ -200,14 +276,18 @@ public struct OfflineDiarizerConfig: Sendable {
         clustering: Clustering = .community,
         vbx: VBx = .community,
         postProcessing: PostProcessing = .community,
-        export: Export = .none
+        zeroVoteReembed: ZeroVoteReembed = .disabled,
+        export: Export = .none,
+        exposeChunkEmbeddings: Bool = false
     ) {
         self.segmentation = segmentation
         self.embedding = embedding
         self.clustering = clustering
         self.vbx = vbx
         self.postProcessing = postProcessing
+        self.zeroVoteReembed = zeroVoteReembed
         self.export = export
+        self.exposeChunkEmbeddings = exposeChunkEmbeddings
     }
 
     public init(
@@ -219,6 +299,7 @@ public struct OfflineDiarizerConfig: Sendable {
         segmentationStepRatio: Double = Segmentation.community.stepRatio,
         embeddingBatchSize: Int = Embedding.community.batchSize,
         embeddingExcludeOverlap: Bool = Embedding.community.excludeOverlap,
+        embeddingSkipStrategy: EmbeddingSkipStrategy = Embedding.community.skipStrategy,
         minSegmentDuration: Double = Embedding.community.minSegmentDurationSeconds,
         minGapDuration: Double = PostProcessing.community.minGapDurationSeconds,
         exclusiveSegments: Bool = PostProcessing.community.exclusiveSegments,
@@ -243,7 +324,8 @@ public struct OfflineDiarizerConfig: Sendable {
             embedding: Embedding(
                 batchSize: embeddingBatchSize,
                 excludeOverlap: embeddingExcludeOverlap,
-                minSegmentDurationSeconds: minSegmentDuration
+                minSegmentDurationSeconds: minSegmentDuration,
+                skipStrategy: embeddingSkipStrategy
             ),
             clustering: Clustering(
                 threshold: clusteringThreshold,
@@ -273,10 +355,11 @@ public struct OfflineDiarizerConfig: Sendable {
 
     /// Validate configuration values and throw if they fall outside expected ranges.
     public func validate() throws {
-        let maxClusteringThreshold = sqrt(2.0)
+        // Euclidean distances between unit-normalized embeddings live in [0, 2].
+        let maxClusteringThreshold = 2.0
         guard clustering.threshold > 0, clustering.threshold <= maxClusteringThreshold else {
             throw OfflineDiarizationError.invalidConfiguration(
-                "clustering.threshold must be within (0, sqrt(2)], got \(clustering.threshold)"
+                "clustering.threshold must be within (0, 2], got \(clustering.threshold)"
             )
         }
 
@@ -333,6 +416,12 @@ public struct OfflineDiarizerConfig: Sendable {
         guard postProcessing.minGapDurationSeconds >= 0 else {
             throw OfflineDiarizationError.invalidConfiguration(
                 "minGapDuration must be >= 0"
+            )
+        }
+
+        guard zeroVoteReembed.minDurationSeconds >= 0 else {
+            throw OfflineDiarizationError.invalidConfiguration(
+                "zeroVoteReembed.minDurationSeconds must be >= 0, got \(zeroVoteReembed.minDurationSeconds)"
             )
         }
 
@@ -407,6 +496,11 @@ public struct OfflineDiarizerConfig: Sendable {
     public var embeddingExcludeOverlap: Bool {
         get { embedding.excludeOverlap }
         set { embedding.excludeOverlap = newValue }
+    }
+
+    public var embeddingSkipStrategy: EmbeddingSkipStrategy {
+        get { embedding.skipStrategy }
+        set { embedding.skipStrategy = newValue }
     }
 
     public var minSegmentDuration: Double {
@@ -564,6 +658,46 @@ public struct VBxOutput: Sendable {
         self.elbos = elbos
         self.wasAdjusted = wasAdjusted
         self.originalClusterCount = originalClusterCount
+    }
+
+    /// Mixture-weight epsilon below which a VBx cluster counts as collapsed.
+    public static let activeClusterEpsilon = 1e-7
+
+    /// Number of clusters VBx actually kept (mixture weight above epsilon).
+    ///
+    /// VBx is warm-started with the AHC cluster count (`numClusters`) and prunes
+    /// clusters by driving their mixture weight to zero, so this — not
+    /// `numClusters` — is the auto-detected speaker count (pyannote parity).
+    ///
+    /// Note: a cluster can keep trace mixture weight without ever being any
+    /// embedding's best cluster; `assignedClusterCount` is the count callers
+    /// actually observe after hard assignment.
+    public var activeClusterCount: Int {
+        guard !pi.isEmpty else { return numClusters }
+        return pi.filter { $0 > Self.activeClusterEpsilon }.count
+    }
+
+    /// Number of clusters that win at least one embedding's argmax responsibility.
+    ///
+    /// A cluster can survive the `pi > epsilon` test while never being any
+    /// embedding's best cluster; it then receives no hard assignments and
+    /// vanishes from the pipeline output. Speaker-count constraints must be
+    /// checked against this count — the one callers see — or a request equal to
+    /// the pi-census is silently ignored while the output shows fewer speakers.
+    public var assignedClusterCount: Int {
+        guard !gamma.isEmpty else { return activeClusterCount }
+        var winners = Set<Int>()
+        for row in gamma {
+            guard !row.isEmpty else { continue }
+            var best = 0
+            var bestValue = row[0]
+            for index in 1..<row.count where row[index] > bestValue {
+                bestValue = row[index]
+                best = index
+            }
+            winners.insert(best)
+        }
+        return winners.isEmpty ? activeClusterCount : winners.count
     }
 }
 

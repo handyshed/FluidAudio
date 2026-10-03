@@ -11,6 +11,8 @@ final class ModelRegistryTests: XCTestCase {
         super.tearDown()
         // Reset the custom base URL after each test
         ModelRegistry.baseURL = "https://huggingface.co"
+        ModelRegistry.repoOverrides = [:]
+        ModelRegistry.revisionOverrides = [:]
     }
 
     // MARK: - Registry URL Configuration Priority Tests
@@ -85,6 +87,20 @@ final class ModelRegistryTests: XCTestCase {
         XCTAssertEqual(url.absoluteString, expectedPath, "Resolve model URL should be constructed correctly")
     }
 
+    func testResolveModelURLWithImmutableRevision() throws {
+        let revision = "df2625ac79a7ac6b65ad868fee6d80f320da4232"
+        let url = try ModelRegistry.resolveModel(
+            "FluidInference/speaker-diarization-coreml",
+            "Segmentation.mlmodelc/model.mil",
+            revision: revision
+        )
+
+        XCTAssertEqual(
+            url.absoluteString,
+            "https://huggingface.co/FluidInference/speaker-diarization-coreml/resolve/\(revision)/Segmentation.mlmodelc/model.mil"
+        )
+    }
+
     func testResolveModelURLWithCustomRegistry() throws {
         let customRegistry = "https://models.internal.corp"
         ModelRegistry.baseURL = customRegistry
@@ -144,6 +160,17 @@ final class ModelRegistryTests: XCTestCase {
             "https://datasets.internal.corp/datasets/FluidInference/librispeech/resolve/main/test-clean.tar.gz"
 
         XCTAssertEqual(url.absoluteString, expectedPath, "Resolve dataset URL should use custom registry")
+    }
+
+    func testResolveDatasetURLAtPinnedRevision() throws {
+        let revision = "1f3714b5a3f98cedef1bbb017f21bbd7ae688596"
+        let url = try ModelRegistry.resolveDataset(
+            "FluidInference/aec-challenge-synthetic-mini", "aec-synthetic-mini.tar.gz", revision: revision)
+
+        XCTAssertEqual(
+            url.absoluteString,
+            "https://huggingface.co/datasets/FluidInference/aec-challenge-synthetic-mini/resolve/\(revision)/aec-synthetic-mini.tar.gz"
+        )
     }
 
     // MARK: - Dataset Base URL Tests
@@ -266,4 +293,114 @@ final class ModelRegistryTests: XCTestCase {
                 "URL should contain file path for registry: \(registry)")
         }
     }
+
+    // MARK: - Repository Override Tests
+
+    func testNoOverridesLeavesRepoPathUnchanged() throws {
+        let url = try ModelRegistry.resolveModel("FluidInference/parakeet-tdt-0.6b-v3-coreml", "config.json")
+        XCTAssertEqual(
+            url.absoluteString,
+            "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/config.json",
+            "An empty override map must not alter the upstream path")
+    }
+
+    func testOverrideRedirectsResolveModel() throws {
+        ModelRegistry.repoOverrides = [
+            "FluidInference/parakeet-tdt-0.6b-v3-coreml": "DictionLabs/parakeet-tdt-0.6b-v3-coreml"
+        ]
+
+        let url = try ModelRegistry.resolveModel(
+            "FluidInference/parakeet-tdt-0.6b-v3-coreml", "Encoder.mlmodelc/model.mil")
+        XCTAssertEqual(
+            url.absoluteString,
+            "https://huggingface.co/DictionLabs/parakeet-tdt-0.6b-v3-coreml/resolve/main/Encoder.mlmodelc/model.mil")
+    }
+
+    /// apiModels and resolveModel must map identically, or the library would list files from
+    /// one repository and download them from another.
+    func testOverrideAppliesToApiModelsToo() throws {
+        ModelRegistry.repoOverrides = [
+            "FluidInference/silero-vad-coreml": "DictionLabs/silero-vad-coreml"
+        ]
+
+        let url = try ModelRegistry.apiModels("FluidInference/silero-vad-coreml", "tree/main")
+        XCTAssertEqual(
+            url.absoluteString,
+            "https://huggingface.co/api/models/DictionLabs/silero-vad-coreml/tree/main")
+    }
+
+    func testUnmappedRepoFallsThroughToUpstream() throws {
+        ModelRegistry.repoOverrides = [
+            "FluidInference/silero-vad-coreml": "DictionLabs/silero-vad-coreml"
+        ]
+
+        let url = try ModelRegistry.resolveModel("FluidInference/parakeet-tdt-0.6b-v2-coreml", "config.json")
+        XCTAssertEqual(
+            url.absoluteString,
+            "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v2-coreml/resolve/main/config.json",
+            "A partial mirror must leave unmapped repos pointing upstream")
+    }
+
+    /// Several Repo cases carry a subpath, e.g. `.../parakeet-realtime-eou-120m-coreml/160ms`.
+    func testOverrideMapsSubpaths() throws {
+        ModelRegistry.repoOverrides = [
+            "FluidInference/parakeet-realtime-eou-120m-coreml": "DictionLabs/parakeet-realtime-eou-120m-coreml"
+        ]
+
+        let url = try ModelRegistry.resolveModel(
+            "FluidInference/parakeet-realtime-eou-120m-coreml/160ms", "config.json")
+        XCTAssertEqual(
+            url.absoluteString,
+            "https://huggingface.co/DictionLabs/parakeet-realtime-eou-120m-coreml/160ms/resolve/main/config.json")
+    }
+
+    /// Longest key wins, so ordering of the dictionary cannot change the result.
+    func testLongestPrefixWins() throws {
+        ModelRegistry.repoOverrides = [
+            "FluidInference/parakeet-realtime-eou-120m-coreml": "DictionLabs/broad",
+            "FluidInference/parakeet-realtime-eou-120m-coreml/160ms": "DictionLabs/specific",
+        ]
+
+        let url = try ModelRegistry.resolveModel("FluidInference/parakeet-realtime-eou-120m-coreml/160ms", "c.json")
+        XCTAssertEqual(url.absoluteString, "https://huggingface.co/DictionLabs/specific/resolve/main/c.json")
+    }
+
+    func testOverrideComposesWithCustomBaseURL() throws {
+        ModelRegistry.baseURL = "https://models.diction.one"
+        ModelRegistry.repoOverrides = ["FluidInference/silero-vad-coreml": "DictionLabs/silero-vad-coreml"]
+
+        let url = try ModelRegistry.resolveModel("FluidInference/silero-vad-coreml", "config.json")
+        XCTAssertEqual(
+            url.absoluteString,
+            "https://models.diction.one/DictionLabs/silero-vad-coreml/resolve/main/config.json")
+    }
+
+    func testRevisionOverrideUsesOriginalRepositoryPath() {
+        let repo = "FluidInference/speaker-diarization-coreml"
+        ModelRegistry.repoOverrides = [repo: "Internal/diarizer"]
+        ModelRegistry.revisionOverrides = [repo: "mirror-release-1"]
+
+        XCTAssertEqual(
+            ModelRegistry.mapRevision(repo, default: String(repeating: "a", count: 40)),
+            "mirror-release-1"
+        )
+        XCTAssertEqual(ModelRegistry.mapRepoPath(repo), "Internal/diarizer")
+    }
+
+    func testRevisionOverrideUsesLongestPrefixAndFallsBackToDefault() {
+        ModelRegistry.revisionOverrides = [
+            "FluidInference/models": "broad",
+            "FluidInference/models/variant": "specific",
+        ]
+
+        XCTAssertEqual(
+            ModelRegistry.mapRevision("FluidInference/models/variant/q8", default: "upstream"),
+            "specific"
+        )
+        XCTAssertEqual(
+            ModelRegistry.mapRevision("FluidInference/unmapped", default: "upstream"),
+            "upstream"
+        )
+    }
+
 }

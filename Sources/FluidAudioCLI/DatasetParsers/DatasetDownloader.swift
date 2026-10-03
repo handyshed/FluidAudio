@@ -5,7 +5,17 @@ import FluidAudio
 
 /// Dataset downloading functionality for AMI and VAD datasets
 struct DatasetDownloader {
-    private static let logger = AppLogger(category: "Dataset")
+    internal static let logger = AppLogger(category: "Dataset")
+
+    /// Official AMI SDM 16-meeting test set (EN2002a-d, ES2004a-d, IS1009a-d, TS3003a-d).
+    /// Matches the evaluation convention used by NeMo, pyannote, and Sortformer papers.
+    /// Single source of truth for both dataset download and benchmark enumeration.
+    static let officialAMITestSet: [String] = [
+        "EN2002a", "EN2002b", "EN2002c", "EN2002d",
+        "ES2004a", "ES2004b", "ES2004c", "ES2004d",
+        "IS1009a", "IS1009b", "IS1009c", "IS1009d",
+        "TS3003a", "TS3003b", "TS3003c", "TS3003d",
+    ]
 
     enum AMIVariant: String, CaseIterable {
         case sdm = "sdm"  // Single Distant Microphone (Mix-Headset.wav)
@@ -27,7 +37,7 @@ struct DatasetDownloader {
     }
 
     static func downloadAMIDataset(
-        variant: AMIVariant, force: Bool, singleFile: String? = nil
+        variant: AMIVariant, force: Bool, singleFile: String? = nil, meetingIds: [String]? = nil
     )
         async
     {
@@ -49,19 +59,16 @@ struct DatasetDownloader {
 
         // Download AMI annotations first (required for proper benchmarking)
         await downloadAMIAnnotations(force: force)
+        await downloadAMIRTTMs(force: force, singleFile: singleFile, meetingIds: meetingIds)
 
         // Official AMI SDM test set (16 meetings) - matches NeMo evaluation
         let commonMeetings: [String]
         if let singleFile = singleFile {
             commonMeetings = [singleFile]
+        } else if let meetingIds {
+            commonMeetings = meetingIds
         } else {
-            commonMeetings = [
-                // Full 16-meeting AMI SDM test set
-                "EN2002a", "EN2002b", "EN2002c", "EN2002d",
-                "ES2004a", "ES2004b", "ES2004c", "ES2004d",
-                "IS1009a", "IS1009b", "IS1009c", "IS1009d",
-                "TS3003a", "TS3003b", "TS3003c", "TS3003d",
-            ]
+            commonMeetings = Self.officialAMITestSet
             logger.info("📋 Downloading official AMI SDM test set (16 meetings)")
         }
 
@@ -104,22 +111,28 @@ struct DatasetDownloader {
     ) async
         -> Bool
     {
-        // Try multiple URL patterns - the AMI corpus mirror structure has some variations
-        let baseURLs = [
-            "https://groups.inf.ed.ac.uk/ami/AMICorpusMirror//amicorpus",  // Double slash pattern (from user's working example)
-            "https://groups.inf.ed.ac.uk/ami/AMICorpusMirror/amicorpus",  // Single slash pattern
-            "https://groups.inf.ed.ac.uk/ami/AMICorpusMirror//amicorpus",  // Alternative with extra slash
+        // Prefer the HuggingFace mirror (hosts the official 16-meeting SDM test
+        // split), then fall back to the intermittently-available Edinburgh
+        // server. Meetings or variants absent from the mirror 404 and fall
+        // through to upstream.
+        let mirrorURL =
+            "https://huggingface.co/datasets/FluidInference/ami-corpus-mirror/resolve/main/\(variant.rawValue)/\(meetingId).\(variant.filePattern)"
+        // Both slash patterns of the upstream corpus mirror have been seen working.
+        let upstreamBases = [
+            "https://groups.inf.ed.ac.uk/ami/AMICorpusMirror//amicorpus",
+            "https://groups.inf.ed.ac.uk/ami/AMICorpusMirror/amicorpus",
         ]
+        let candidateURLs =
+            [mirrorURL]
+            + upstreamBases.map { "\($0)/\(meetingId)/audio/\(meetingId).\(variant.filePattern)" }
 
-        for (_, baseURL) in baseURLs.enumerated() {
-            let urlString = "\(baseURL)/\(meetingId)/audio/\(meetingId).\(variant.filePattern)"
-
+        for urlString in candidateURLs {
             guard let url = URL(string: urlString) else {
                 continue
             }
 
             do {
-                let (data, response) = try await DownloadUtils.sharedSession.data(from: url)
+                let (data, response) = try await ModelHub.session.data(from: url)
 
                 if let httpResponse = response as? HTTPURLResponse {
                     if httpResponse.statusCode == 200 {
@@ -184,14 +197,31 @@ struct DatasetDownloader {
             return
         }
 
-        // Download and extract AMI manual annotations v1.6.2
-        let zipURL =
-            "https://groups.inf.ed.ac.uk/ami/AMICorpusAnnotations/ami_public_manual_1.6.2.zip"
+        // Download and extract AMI manual annotations v1.6.2.
+        // Prefer the HuggingFace mirror — the upstream Edinburgh server is
+        // intermittently down, and a single transient failure here once
+        // poisoned a CI benchmark run with placeholder ground truth (#752).
+        let zipURLs = [
+            "https://huggingface.co/datasets/FluidInference/ami-corpus-mirror/resolve/main/annotations/ami_public_manual_1.6.2.zip",
+            "https://groups.inf.ed.ac.uk/ami/AMICorpusAnnotations/ami_public_manual_1.6.2.zip",
+        ]
         let zipFile = annotationsDir.appendingPathComponent("ami_public_manual_1.6.2.zip")
-        let zipSuccess = await downloadAnnotationFile(from: zipURL, to: zipFile)
+
+        var zipSuccess = false
+        let maxAttempts = 3
+        attempts: for attempt in 1...maxAttempts {
+            for zipURL in zipURLs {
+                zipSuccess = await downloadAnnotationFile(from: zipURL, to: zipFile)
+                if zipSuccess { break attempts }
+            }
+            logger.warning("Annotation download attempt \(attempt)/\(maxAttempts) failed for all sources")
+            if attempt < maxAttempts {
+                try? await Task.sleep(nanoseconds: UInt64(attempt) * 2_000_000_000)
+            }
+        }
 
         if !zipSuccess {
-            logger.error("Failed to download AMI annotations")
+            logger.error("Failed to download AMI annotations after \(maxAttempts) attempts")
             return
         }
 
@@ -224,7 +254,7 @@ struct DatasetDownloader {
         }
 
         do {
-            let (data, response) = try await DownloadUtils.sharedSession.data(from: url)
+            let (data, response) = try await ModelHub.session.data(from: url)
 
             if let httpResponse = response as? HTTPURLResponse {
                 if httpResponse.statusCode == 200 {
@@ -253,6 +283,106 @@ struct DatasetDownloader {
         }
 
         return false
+    }
+
+    /// Sync AMI forced-alignment RTTMs from the local diar-forced-alignment repo into the standard cache path.
+    static func downloadAMIRTTMs(
+        force: Bool = false,
+        singleFile: String? = nil,
+        meetingIds: [String]? = nil
+    ) async {
+        let fileManager = FileManager.default
+        let homeDir = fileManager.homeDirectoryForCurrentUser
+        let workingDir = URL(fileURLWithPath: fileManager.currentDirectoryPath)
+        let sourceRoot = workingDir.appendingPathComponent("Datasets/diar-forced-alignment/AMI")
+        let destinationDir = homeDir.appendingPathComponent("FluidAudioDatasets/ami_official/rttm")
+        await downloadAMIRTTMs(
+            force: force,
+            singleFile: singleFile,
+            meetingIds: meetingIds,
+            sourceRoot: sourceRoot,
+            destinationDir: destinationDir,
+            fileManager: fileManager
+        )
+    }
+
+    static func downloadAMIRTTMs(
+        force: Bool = false,
+        singleFile: String? = nil,
+        meetingIds: [String]? = nil,
+        sourceRoot: URL,
+        destinationDir: URL,
+        fileManager: FileManager = .default
+    ) async {
+        guard fileManager.fileExists(atPath: sourceRoot.path) else {
+            logger.warning("AMI forced-alignment RTTM repo not found at \(sourceRoot.path)")
+            return
+        }
+
+        do {
+            try fileManager.createDirectory(at: destinationDir, withIntermediateDirectories: true)
+        } catch {
+            logger.error("Failed to create AMI RTTM directory: \(error)")
+            return
+        }
+
+        let selectedMeetingIds: [String]
+        if let singleFile {
+            selectedMeetingIds = [singleFile]
+        } else if let meetingIds {
+            selectedMeetingIds = meetingIds
+        } else {
+            selectedMeetingIds = [
+                "EN2002a", "EN2002b", "EN2002c", "EN2002d",
+                "ES2004a", "ES2004b", "ES2004c", "ES2004d",
+                "IS1009a", "IS1009b", "IS1009c", "IS1009d",
+                "TS3003a", "TS3003b", "TS3003c", "TS3003d",
+            ]
+        }
+
+        var copiedFiles = 0
+        var skippedFiles = 0
+        var missingFiles: [String] = []
+
+        for meetingId in selectedMeetingIds {
+            let destinationURL = destinationDir.appendingPathComponent("\(meetingId).rttm")
+            if !force && fileManager.fileExists(atPath: destinationURL.path) {
+                skippedFiles += 1
+                continue
+            }
+
+            guard let sourceURL = findAMIRTTMSource(meetingId: meetingId, sourceRoot: sourceRoot) else {
+                missingFiles.append(meetingId)
+                continue
+            }
+
+            if fileManager.fileExists(atPath: destinationURL.path) {
+                try? fileManager.removeItem(at: destinationURL)
+            }
+
+            do {
+                try fileManager.copyItem(at: sourceURL, to: destinationURL)
+                copiedFiles += 1
+            } catch {
+                logger.error("Failed to copy RTTM for \(meetingId): \(error)")
+            }
+        }
+
+        logger.info("AMI RTTMs: \(copiedFiles) copied, \(skippedFiles) skipped")
+        if !missingFiles.isEmpty {
+            logger.warning("Missing AMI RTTMs for: \(missingFiles.sorted().joined(separator: ", "))")
+        }
+    }
+
+    private static func findAMIRTTMSource(meetingId: String, sourceRoot: URL) -> URL? {
+        let fileManager = FileManager.default
+        let candidateURLs = [
+            sourceRoot.appendingPathComponent("test/\(meetingId).rttm"),
+            sourceRoot.appendingPathComponent("dev/\(meetingId).rttm"),
+            sourceRoot.appendingPathComponent("train/\(meetingId).rttm"),
+        ]
+
+        return candidateURLs.first { fileManager.fileExists(atPath: $0.path) }
     }
 
     /// Extract ZIP file using system unzip command
@@ -473,7 +603,7 @@ struct DatasetDownloader {
                 userInfo: [NSLocalizedDescriptionKey: "Invalid API URL"])
         }
 
-        let (data, _) = try await DownloadUtils.sharedSession.data(from: url)
+        let (data, _) = try await ModelHub.session.data(from: url)
 
         // Parse the JSON response to extract file names
         if let json = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
@@ -528,7 +658,7 @@ struct DatasetDownloader {
         )
 
         // Download using URLSession
-        let (data, _) = try await DownloadUtils.sharedSession.data(from: url)
+        let (data, _) = try await ModelHub.session.data(from: url)
         try data.write(to: destination)
 
         // Verify it's valid audio
@@ -587,7 +717,7 @@ struct DatasetDownloader {
 
         do {
             // Download the tar.gz file
-            let (downloadURL, response) = try await DownloadUtils.sharedSession.download(
+            let (downloadURL, response) = try await ModelHub.session.download(
                 from: URL(string: musanURL)!)
 
             // Check response
@@ -693,8 +823,9 @@ struct DatasetDownloader {
         let type: String
     }
 
-    /// Download Earnings22 KWS dataset from argmaxinc/earnings22-kws-golden
+    /// Download Earnings22 KWS dataset from argmaxinc/contextual-earnings22
     /// using the HuggingFace Datasets Server REST API (pure Swift, no Python dependency).
+    /// (Previously argmaxinc/earnings22-kws-golden, which was consolidated into contextual-earnings22.)
     static func downloadEarnings22KWS(force: Bool) async {
         let cacheDir = getEarnings22Directory()
         let testDatasetDir = cacheDir.appendingPathComponent("test-dataset")
@@ -725,7 +856,7 @@ struct DatasetDownloader {
 
         // Fetch rows via HuggingFace Datasets Server API (paginated, max 100 per request)
         let baseURL = "https://datasets-server.huggingface.co/rows"
-        let dataset = "argmaxinc/earnings22-kws-golden"
+        let dataset = "argmaxinc/contextual-earnings22"
         let pageSize = 100
         var offset = 0
         var totalExtracted = 0
@@ -743,7 +874,7 @@ struct DatasetDownloader {
             }
 
             do {
-                let (data, response) = try await DownloadUtils.sharedSession.data(from: apiURL)
+                let (data, response) = try await ModelHub.session.data(from: apiURL)
 
                 guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
                     let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
@@ -775,7 +906,7 @@ struct DatasetDownloader {
                         continue
                     }
 
-                    let (audioData, audioResponse) = try await DownloadUtils.sharedSession.data(from: audioURL)
+                    let (audioData, audioResponse) = try await ModelHub.session.data(from: audioURL)
                     guard let audioHTTP = audioResponse as? HTTPURLResponse, audioHTTP.statusCode == 200 else {
                         logger.warning("Failed to download audio for \(fileId)")
                         continue
@@ -872,46 +1003,60 @@ struct DatasetDownloader {
             task.waitUntilExit()
 
             if task.terminationStatus == 0 {
-                // Move the audio files to our cache structure
-                let sourceCleanDir = cloneDir.appendingPathComponent("clean")
-                let sourceNoisyDir = cloneDir.appendingPathComponent("noisy")
-
                 // Create destination directories
                 try FileManager.default.createDirectory(
                     at: cleanDir, withIntermediateDirectories: true)
                 try FileManager.default.createDirectory(
                     at: noisyDir, withIntermediateDirectories: true)
 
-                // Move clean files
-                var cleanCount = 0
-                var noisyCount = 0
-                if FileManager.default.fileExists(atPath: sourceCleanDir.path) {
-                    let cleanFiles = try FileManager.default.contentsOfDirectory(
-                        at: sourceCleanDir, includingPropertiesForKeys: nil)
-                    for file in cleanFiles where file.pathExtension == "wav" {
-                        let destination = cleanDir.appendingPathComponent(
-                            file.lastPathComponent)
-                        try FileManager.default.moveItem(at: file, to: destination)
-                        cleanCount += 1
-                    }
+                // The repo ships its audio inside `VOiCES_90_*.tar` archives (deeply
+                // nested), not as loose `clean/`+`noisy/` wavs. Extract every tar into
+                // a scratch dir, then classify each wav by the noise tag in its name:
+                //   Lab41-SRI-VOiCES-rmX-<cond>-...  ->  "none" = clean, else noisy.
+                // (All VOiCES clips are speech; the split only affects logging/balance.)
+                let extractDir = cloneDir.appendingPathComponent("_extract")
+                try? FileManager.default.removeItem(at: extractDir)
+                try FileManager.default.createDirectory(
+                    at: extractDir, withIntermediateDirectories: true)
+
+                let cloneContents =
+                    (try? FileManager.default.contentsOfDirectory(
+                        at: cloneDir, includingPropertiesForKeys: nil)) ?? []
+                for archive in cloneContents where archive.pathExtension.lowercased() == "tar" {
+                    let untar = Process()
+                    untar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+                    untar.arguments = ["xf", archive.path, "-C", extractDir.path]
+                    try? untar.run()
+                    untar.waitUntilExit()
                 }
 
-                // Move noisy files
-                if FileManager.default.fileExists(atPath: sourceNoisyDir.path) {
-                    let noisyFiles = try FileManager.default.contentsOfDirectory(
-                        at: sourceNoisyDir, includingPropertiesForKeys: nil)
-                    for file in noisyFiles where file.pathExtension == "wav" {
-                        let destination = noisyDir.appendingPathComponent(
-                            file.lastPathComponent)
+                // Recursively collect every extracted wav and sort it by filename tag.
+                var cleanCount = 0
+                var noisyCount = 0
+                if let enumerator = FileManager.default.enumerator(
+                    at: extractDir, includingPropertiesForKeys: nil)
+                {
+                    while let file = enumerator.nextObject() as? URL {
+                        guard file.pathExtension.lowercased() == "wav" else { continue }
+                        let name = file.lastPathComponent
+                        let isClean = name.contains("-none-")
+                        let destination =
+                            (isClean ? cleanDir : noisyDir).appendingPathComponent(name)
+                        try? FileManager.default.removeItem(at: destination)
                         try FileManager.default.moveItem(at: file, to: destination)
-                        noisyCount += 1
+                        if isClean { cleanCount += 1 } else { noisyCount += 1 }
                     }
                 }
 
                 // Clean up clone directory
                 try? FileManager.default.removeItem(at: cloneDir)
 
-                logger.info("VOiCES subset ready: \(cleanCount) clean, \(noisyCount) noisy")
+                if cleanCount + noisyCount == 0 {
+                    logger.error(
+                        "VOiCES clone contained no extractable wavs (repo layout changed?)")
+                } else {
+                    logger.info("VOiCES subset ready: \(cleanCount) clean, \(noisyCount) noisy")
+                }
 
             } else {
                 logger.error("Git clone failed")

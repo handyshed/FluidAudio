@@ -6,8 +6,15 @@
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20iOS-blue.svg)](https://developer.apple.com)
 [![Documentation](https://img.shields.io/badge/Documentation-docs.fluidinference.com-008574.svg)](https://docs.fluidinference.com/introduction)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Chat-7289da.svg)](https://discord.gg/WNsvaCtmDe)
-[![Hugging Face Models](https://img.shields.io/badge/Hugging%20Face%20Models-800k%2B%20downloads-brightgreen?logo=huggingface)](https://huggingface.co/FluidInference)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/FluidInference/FluidAudio)
+[![Hugging Face Models](https://img.shields.io/badge/Hugging%20Face%20Models-500k%2B%20Monthly%20Downloads-brightgreen?logo=huggingface)](https://huggingface.co/FluidInference)
+
+
+<div align="center">
+
+<a href="https://trendshift.io/repositories/26004?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-26004" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/26004" alt="FluidInference%2FFluidAudio | Trendshift" width="250" height="55"/></a>
+
+</div>
+
 
 FluidAudio is a Swift SDK for fully local, low-latency audio AI on Apple devices, with inference offloaded to the Apple Neural Engine (ANE), resulting in less memory and generally faster inference.
 
@@ -28,21 +35,22 @@ Below are some featured local AI apps using Fluid Audio models on macOS and iOS:
   <a href="https://snaply.ai"><img src="Documentation/assets/snaply.png" height="40" alt="Snaply"></a>
   <a href="https://github.com/yazinsai/OpenOats"><img src="Documentation/assets/openoats.png" height="40" alt="OpenOats"></a>
   <a href="https://talat.app"><img src="Documentation/assets/talat.png" height="40" alt="Talat"></a>
-<!-- Add your app: submit logo via PR. The Fluid Inference team works to curate this and add new apps to the showcase section every couple of weeks. We appreciate your patience. -->
+<!-- Add your app: submit logo via PR. The Fluid Inference team works to curate this and add new apps to the showcase section, please do not add to this section if you're adding the app to the showcase section, but including a logo in your PR will help us when we update this section! We appreciate your patience. -->
 </p>
 
 Want to convert your own model? Check [möbius](https://github.com/FluidInference/mobius)
 
 ## Highlights
 
-- **Automatic Speech Recognition (ASR)**: Parakeet TDT v3 (0.6b) for batch transcription supporting 25 European languages; Parakeet EOU (120m) for streaming ASR with end-of-utterance detection (English only)
-- **Inverse Text Normalization (ITN)**: Post-process ASR output to convert spoken-form to written-form ("two hundred" → "200"). See [text-processing-rs](https://github.com/FluidInference/text-processing-rs)
-- **Text-to-Speech (TTS)**: Kokoro (82m) for parallel synthesis with SSML and pronunciation control across 9 languages (EN, ES, FR, HI, IT, JA, PT, ZH); PocketTTS for streaming TTS with voice cloning support (English only)
+- **Automatic Speech Recognition (ASR)**: [Parakeet TDT v3](Documentation/Models.md#batch-transcription-near-real-time) (0.6b) and other TDT/CTC models for batch transcription supporting 25 European languages and Japanese, plus SenseVoice and Paraformer for Mandarin Chinese; [Parakeet EOU](Documentation/Models.md#streaming-transcription-true-real-time) (120m) for streaming ASR with end-of-utterance detection (English only). See all [ASR models](Documentation/Models.md#asr-models).
+- **Inverse Text Normalization (ITN)**: Post-process ASR output to convert spoken-form to written-form ("two hundred" → "200"). See [text-processing-rs](https://github.com/FluidInference/text-processing-rs). Optional: ASR-only apps can drop the engine (~8 MB per slice) with `traits: []` (Swift 6.2+), see [PostProcessing.md](Documentation/ASR/PostProcessing.md#opting-out-of-the-engine)
+- **Text-to-Speech (TTS)**: Kokoro (82m) for parallel synthesis with SSML and pronunciation control across 9 languages (EN, ES, FR, HI, IT, JA, PT, ZH); PocketTTS for streaming TTS with voice cloning support (EN, DE, ES, FR, IT, PT — 6L and 24L variants); Chatterbox Multilingual (520M, 18 languages) and Chatterbox Nano (110M, English with `[laugh]`/`[chuckle]` paralinguistic tags) in beta — see [Documentation/TTS/Chatterbox.md](Documentation/TTS/Chatterbox.md)
 - **Speaker Diarization (Online + Offline)**: Speaker separation and identification across audio streams. Streaming pipeline for real-time processing and offline batch pipeline with advanced clustering.
 - **Speaker Embedding Extraction**: Generate speaker embeddings for voice comparison and clustering, you can use this for speaker identification
 - **Voice Activity Detection (VAD)**: Voice activity detection with Silero models
+- **Speech Enhancement (AEC + Noise Suppression)**: [LocalVQE](Documentation/Enhancement/LocalVQE.md) (4.8M) removes loudspeaker echo, noise and reverb from 16 kHz mic audio given a far-end reference; streaming with 16 ms latency (beta)
 - **Apple Neural Engine**: Models run efficiently on Apple's ANE for maximum performance with minimal power consumption
-- **Open-Source Models**: All models are publicly available on HuggingFace — converted and optimized by our team; permissive licenses
+- **Open-Source Models**: All models are publicly available on HuggingFace — converted and optimized by our team; permissive licenses. See [full model catalog](Documentation/Models.md).
 
 ## Video Demos
 
@@ -54,48 +62,70 @@ Want to convert your own model? Check [möbius](https://github.com/FluidInferenc
 | **[Parakeet Realtime EOU](https://x.com/sach1n/status/2003210626659680762)** | Parakeet streaming ASR with end-of-utterance detection on iOS |
 | **[Sortformer Diarization](https://x.com/Alex_tra_memory/status/2010530705667661843)** | Sortformer for speaker diarization with overlapping speech on iOS |
 | **[PocketTTS](https://x.com/sach1n/status/2017627657006158296)** | Streaming text-to-speech using PocketTTS on iOS |
+| **[Parakeet EOU Ultra-Low Latency](https://x.com/y_earu/status/2038654262608064967)** | Real-time Parakeet EOU transcription on iOS demonstrating ultra-low latency speech-to-text |
+| **[Action Phrase Live Production Control](https://www.youtube.com/watch?v=ykcvdTHHmrk)** | Voice-controlled live production workflow using FluidAudio's ASR and speaker diarization to trigger cameras, graphics, and layouts with natural voice commands |
+| **[talat - VAD, ASR, Speaker ID](https://www.youtube.com/watch?v=OjP4Adrv9_E)** | A video demo showcasing FluidAudio's VAD, two different ASR models, and speaker diarization during a talat.app meeting recording |
+| **[Kyutai PocketTTS on ANE](https://x.com/sach1n/status/2051375097408360596)** | Kyutai labs PocketTTS in iOS running fast on the ANE & background-capable |
+| **[Supertonic-3 on iPhone 17 Pro ANE](https://x.com/sach1n/status/2056476851825250685)** | Supertonic-3 running on iPhone 17 Pro via ANE/CoreML with 2 minutes of audio generated in 3 seconds with low RAM & background support |
 
 ## Showcase
 
 Make a PR if you want to add your app, please keep it in chronological order.
 
-| App | Description |
-| --- | --- |
-| **[Voice Ink](https://tryvoiceink.com/)** | Local AI for instant, private transcription with near-perfect accuracy. Uses Parakeet ASR. |
-| **[Spokenly](https://spokenly.app/)** | Mac dictation app for fast, accurate voice-to-text; supports real-time dictation and file transcription. Uses Parakeet ASR and speaker diarization. |
-| **[Senko](https://github.com/narcotic-sh/senko)** | A very fast and accurate speaker diarization pipeline. A [good example](https://github.com/narcotic-sh/senko/commit/51dbd8bde764c3c6648dbbae57d6aff66c5ca15c) for how to integrate FluidAudio into a Python app |
-| **[Slipbox](https://slipbox.ai/)** | Privacy-first meeting assistant for real-time conversation intelligence. Uses Parakeet ASR (iOS) and speaker diarization across platforms. |
-| **[Whisper Mate](https://whisper.marksdo.com)** | Transcribes movies and audio locally; records and transcribes in real time from speakers or system apps. Uses speaker diarization. |
-| **[Altic/Fluid Voice](https://github.com/altic-dev/Fluid-oss)** | Lightweight Fully free and Open Source Voice to Text dictation for macOS built using FluidAudio. Never pay for dictation apps |
-| **[Paraspeech](https://paraspeech.com)** | AI powered voice to text. Fully offline. No subscriptions. |
-| **[mac-whisper-speedtest](https://github.com/anvanvan/mac-whisper-speedtest)** | Comparison of different local ASR, including one of the first versions of FluidAudio's ASR models |
-| **[Starling](https://github.com/Ryandonofrio3/Starling)** | Open Source, fully local voice-to-text transcription with auto-paste at your cursor. |
-| **[BoltAI](https://boltai.com/)** | Write content 10x faster using parakeet models |
-| **[Voxeoflow](https://www.voxeoflow.app)** | Mac dictation app with real-time translation. Lightning-fast transcription in over 100 languages, instantly translated to your target language. |
-| **[Speakmac](https://speakmac.app)** | Mac app that lets you type anywhere on your Mac using your voice. Fully local, private dictation built on FluidAudio. |
-| **[SamScribe](https://github.com/Steven-Weng/SamScribe)** | An open-source macOS app that captures and transcribes audio from your microphone and meeting applications (Zoom, Teams, Chrome) in real-time, with cross-session speaker recognition. |
-| **[WhisKey](https://whiskey.asktobuild.app/)** | Privacy-first voice dictation keyboard for iOS and macOS. On-device transcription with 12+ languages, AI meeting summaries, and mindmap generation. Great for daily use and vibe-coding. Uses speaker diarization. |
-| **[Dictate Anywhere](https://github.com/hoomanaskari/mac-dictate-anywhere)** | Native macOS dictation app with global Fn key activation. Dictate into any app with 25 language support. Uses Parakeet ASR. |
-| **[hongbomiao.com](https://github.com/hongbo-miao/hongbomiao.com)** | A personal R&D lab that facilitates knowledge sharing. Uses Parakeet ASR. |
-| **[Hex](https://github.com/kitlangton/Hex)** | macOS app that lets you press-and-hold a hotkey to record your voice, transcribe it, and paste into any application. Uses Parakeet ASR. |
-| **[Super Voice Assistant](https://github.com/ykdojo/super-voice-assistant)** | Open-source macOS voice assistant with local transcription. Uses Parakeet ASR. |
-| **[VoiceTypr](https://github.com/moinulmoin/voicetypr)** | Open-source voice-to-text dictation for macOS and Windows. Uses Parakeet ASR. |
-| **[Summit AI Notes](https://summitnotes.app/)** | Local meeting transcription and summarization with speaker identification. Supports 100+ languages. |
-| **[Ora](https://futurelab.studio/ora)** | Local voice assistant for macOS with speech recognition and text-to-speech. |
-| **[Flowstay](https://flowstay.app)** | Easy text-to-speech, local post-processing and Claude Code integration for macOS. Free forever. |
-| **[macos-speech-server](https://github.com/dokterbob/macos-speech-server)** | OpenAI compatible STT/transcription and TTS/speech API server. |
-| **[Snaply](https://snaply.ai)** |Free, Fast, 100% local AI dictation for Mac. |
-| **[OpenOats](https://github.com/yazinsai/OpenOats)** | Open-source meeting note-taker that transcribes conversations in real time and surfaces relevant notes from your knowledge base. Uses FluidAudio for local transcription. |
-| **[Enconvo](https://enconvo.com)** | AI Agent Launcher for macOS with voice input, live captions, and text-to-speech. Uses Parakeet ASR for local speech recognition. |
-| **[Meeting Transcriber](https://github.com/pasrom/meeting-transcriber)** | macOS menu bar app that auto-detects, records, and transcribes meetings (Teams, Zoom, Webex) with dual-track speaker diarization. Uses Parakeet ASR, Qwen3-ASR, and speaker diarization. |
-| **[Hitoku Draft](https://hitoku.me/draft)** | A local, private, voice writing assistant on your macOS menu bar. Uses Parakeet ASR. |
-| **[Audite](https://github.com/zachatrocity/audite)** | macOS menu-bar app that records meetings and transcribes them locally into Markdown notes for Obsidian. Uses Parakeet ASR via FluidAudio on the Apple Neural Engine. |
-| **[Muesli](https://github.com/pHequals7/muesli)** | Native macOS dictation and meeting transcription with ~0.13s latency. Captures microphone and system audio with automatic speaker diarization. Uses Parakeet TDT and Qwen3 ASR. |
-| **[NanoVoice](https://apps.apple.com/kz/app/nanovoice/id6760539688)** | Free iOS voice keyboard for fast, private dictation in any app. Uses Parakeet ASR. |
-| **[MiniWhisper](https://github.com/andyhtran/MiniWhisper)** | Open-source macOS menu bar for quick local voice-to-text with minimal setup. Pick a shortcut, start talking. Uses Parakeet ASR. |
-| **[Talat](https://talat.app)** | Privacy-focused AI meeting notes app. Records and transcribes meetings locally on your Mac with speaker identification and LLM-powered summaries. Featured in [TechCrunch](https://techcrunch.com/2026/03/24/talats-ai-meeting-notes-stay-on-your-machine-not-in-the-cloud/). Uses Parakeet ASR. |
-| **[Volocal](https://github.com/fikrikarim/volocal)** | Fully local voice AI on iOS. Uses streaming Parakeet EOU ASR and streaming PocketTTS. |
-| **[VivaDicta](https://github.com/n0an/VivaDicta)** | Open-source iOS voice-to-text app with system-wide AI voice keyboard — dictate and AI-process text in any app. 15+ AI providers, 40+ AI presets. Uses Parakeet ASR. |
+| App | GitHub | Description |
+| --- | :---: | --- |
+| **[Voice Ink](https://tryvoiceink.com/)** | — | Local AI for instant, private transcription with near-perfect accuracy. Uses Parakeet ASR. |
+| **[Spokenly](https://spokenly.app/)** | — | Mac dictation app for fast, accurate voice-to-text; supports real-time dictation and file transcription. Uses Parakeet ASR and speaker diarization. |
+| **[Senko](https://github.com/narcotic-sh/senko)** | ✓ | A very fast and accurate speaker diarization pipeline. A [good example](https://github.com/narcotic-sh/senko/commit/51dbd8bde764c3c6648dbbae57d6aff66c5ca15c) for how to integrate FluidAudio into a Python app |
+| **[Slipbox](https://slipbox.ai/)** | — | Privacy-first meeting assistant for real-time conversation intelligence. Uses Parakeet ASR (iOS) and speaker diarization across platforms. |
+| **[Whisper Mate](https://whisper.marksdo.com)** | — | Transcribes movies and audio locally; records and transcribes in real time from speakers or system apps. Uses speaker diarization. |
+| **[Altic/Fluid Voice](https://github.com/altic-dev/Fluid-oss)** | ✓ | Lightweight Fully free and Open Source Voice to Text dictation for macOS built using FluidAudio. Never pay for dictation apps |
+| **[Paraspeech](https://paraspeech.com)** | — | AI powered voice to text. Fully offline. No subscriptions. |
+| **[BoltAI](https://boltai.com/)** | — | Write content 10x faster using parakeet models |
+| **[Dictate Anywhere](https://github.com/hoomanaskari/mac-dictate-anywhere)** | ✓ | Native macOS dictation app with global Fn key activation. Dictate into any app with 25 language support. Uses Parakeet ASR. |
+| **[hongbomiao.com](https://github.com/hongbo-miao/hongbomiao.com)** | ✓ | A personal R&D lab that facilitates knowledge sharing. Uses Parakeet ASR. |
+| **[Hex](https://github.com/kitlangton/Hex)** | ✓ | macOS app that lets you press-and-hold a hotkey to record your voice, transcribe it, and paste into any application. Uses Parakeet ASR. |
+| **[Super Voice Assistant](https://github.com/ykdojo/super-voice-assistant)** | ✓ | Open-source macOS voice assistant with local transcription. Uses Parakeet ASR. |
+| **[VoiceTypr](https://github.com/moinulmoin/voicetypr)** | ✓ | Open-source voice-to-text dictation for macOS and Windows. Uses Parakeet ASR. |
+| **[Summit AI Notes](https://summitnotes.app/)** | — | Local meeting transcription and summarization with speaker identification. Supports 100+ languages. |
+| **[Snaply](https://snaply.ai)** | — | Free, Fast, 100% local AI dictation for Mac. |
+| **[OpenOats](https://github.com/yazinsai/OpenOats)** | ✓ | Open-source meeting note-taker that transcribes conversations in real time and surfaces relevant notes from your knowledge base. Uses FluidAudio for local transcription. |
+| **[Enconvo](https://enconvo.com)** | — | AI Agent Launcher for macOS with voice input, live captions, and text-to-speech. Uses Parakeet ASR for local speech recognition. |
+| **[Meeting Transcriber](https://github.com/pasrom/meeting-transcriber)** | ✓ | macOS menu bar app that auto-detects, records, and transcribes meetings (Teams, Zoom, Webex) with dual-track speaker diarization. Uses Parakeet ASR and speaker diarization. |
+| **[Hitoku Draft](https://hitoku.me/draft)** | [✓](https://github.com/Saladino93/hitokudraft) | A local, private, voice writing assistant on your macOS menu bar. Uses Parakeet ASR. |
+| **[Muesli](https://github.com/pHequals7/muesli)** | ✓ | Native macOS dictation and meeting transcription with ~0.13s latency. Captures microphone and system audio with automatic speaker diarization. Uses Parakeet TDT ASR. |
+| **[NanoVoice](https://apps.apple.com/kz/app/nanovoice-ai-voice-keyboard/id6760539688)** | — | Free iOS voice keyboard for fast, private dictation in any app. Uses Parakeet ASR. |
+| **[MiniWhisper](https://github.com/andyhtran/MiniWhisper)** | ✓ | Open-source macOS menu bar for quick local voice-to-text with minimal setup. Pick a shortcut, start talking. Uses Parakeet ASR. |
+| **[Talat](https://talat.app)** | — | Privacy-focused AI meeting notes app. Records and transcribes meetings locally on your Mac with speaker identification and LLM-powered summaries. Featured in [TechCrunch](https://techcrunch.com/2026/03/24/talats-ai-meeting-notes-stay-on-your-machine-not-in-the-cloud/). Uses Parakeet ASR. |
+| **[VivaDicta](https://github.com/n0an/VivaDicta)** | ✓ | Open-source iOS voice-to-text app with system-wide AI voice keyboard — dictate and AI-process text in any app. 15+ AI providers, 40+ AI presets. Uses Parakeet ASR. |
+| **[MimicScribe](https://mimicscribe.app/)** | — | macOS menu bar app combining Parakeet TDT streaming ASR, PyanNote Community 1 speaker diarization, and cloud LLMs to provide AI-generated talking points during meetings, derived from the live transcript and user-provided instructions. Features meeting summarization, natural language search, an MCP server for agent integration, and a keyboard- and voice-forward UI. |
+| **[Action Phrase](https://actionphrase.com/)** | — | Voice-controlled live production app for iOS, iPadOS, and macOS. Control cameras, graphics, layouts, and production workflows with natural voice commands. Integrates with popular tools including OBS, vMix, ProPresenter, Bitfocus Companion, and more. Uses Parakeet TDT ASR and Sortformer diarization. |
+| **[Sayboard](https://github.com/stanlsv/sayboard)** | ✓ | Privacy-first AI voice keyboard for iOS. Local models, no servers, no tracking, no subscriptions, no ads, no in-app purchases. Fully offline and open-source. |
+| **[Kesha Voice Kit](https://github.com/drakulavich/kesha-voice-kit)** | ✓ | Local-first voice toolkit for CLI and LLM-agent workflows. Speech-to-text in 25 languages, text-to-speech in 9, VAD, language detection, and MCP, OpenClaw and Hermes integrations. On Apple Silicon, FluidAudio powers ASR, Kokoro TTS and speaker diarization. |
+| **[Dictato](https://dicta.to)** | — | Turn your voice into text anywhere on your Mac. Fully local, private, and offline — boost your own vocabulary and dictate in multiple languages. Uses Parakeet TDT ASR. |
+| **[Utter](https://github.com/joepetrakovich/utter)** | ✓ | An ultra-minimal speech-to-text status bar utility for Mac.  Register a hotkey and go. |
+| **[Resonant](https://onresonant.com)** | [✓](https://github.com/tohmsc/resonant-community) | macOS voice workspace for dictation, meetings, and ambient work context. Uses FluidAudio for local transcription and speaker diarization. |
+| **[Thoth](https://thoth-app.com)** | — | Privacy-first meeting recorder for Mac. Records both sides of any call with dual-channel audio, transcribes locally with speaker diarization, and summarizes with on-device AI or BYOK cloud. Available on the Mac App Store. Featured in [MacGeneration](https://www.macg.co/logiciels/2026/05/thoth-une-nouvelle-app-de-transcription-axee-sur-les-reunions-et-le-temps-reel-308471). Uses Parakeet EOU and Parakeet TDT ASR. |
+| **[Dettivo](https://dettivo.com)** | — | Local-first Mac app for private dictation, transcripts, and meeting workflows in one place, with developer tooling across CLI, MCP, REST, and app automation. Uses FluidAudio Parakeet TDT ASR and offline speaker diarization. |
+| **[Local Narrator](https://www.localnarrator.app/)** | — | Privacy-first iOS audiobook reader that reads EPUB and PDF books aloud with on-device text-to-speech. Uses FluidAudio Kokoro TTS for local English and Spanish narration. |
+| **[Hedy](https://hedy.ai)** | — | Privacy-first AI meeting coach for iOS, macOS, Android, and Windows. Real-time, fully on-device transcription with speaker diarization and AI-powered conversation insights. Uses Parakeet and Nemotron streaming ASR and speaker diarization on the Apple Neural Engine. |
+| **[Parakey](https://github.com/rcourtman/parakey)** | ✓ | Open-source (MIT) menu-bar push-to-talk dictation for macOS — hold a key, speak, release; the transcript pastes at the cursor in about 100 ms. Uses Parakeet TDT v3 ASR on the Apple Neural Engine via FluidAudio. |
+| **[TypeWhisper](https://www.typewhisper.com/)** | — | Speech-to-text and AI text processing for macOS. Uses FluidAudio's Parakeet ASR for local transcription. |
+| **[evoglyph](https://evoglyph.com)** | — | Lightweight, privacy-first macOS menu-bar dictation — press a hotkey, speak, and cleaned-up text is injected at your cursor. Fully local: Parakeet TDT ASR with CTC vocabulary boosting and Silero VAD via FluidAudio on the Apple Neural Engine, plus on-device LLM cleanup. Audio never leaves the Mac. |
+| **[echo99](https://www.echo99.app)** | — | Private call recorder for macOS. Menu-bar app that records the mic and system audio as separate tracks and transcribes them entirely on-device. |
+| **[Presspeech](https://github.com/rcourtman/presspeech)** | ✓ | Open-source (MIT) menu-bar push-to-talk dictation for macOS — hold a key, speak, release; the transcript pastes at the cursor in about 100 ms. Uses Parakeet TDT v3 ASR on the Apple Neural Engine via FluidAudio. |
+| **[Better Voice](https://voice.baselinemakes.com)** | — | macOS menu-bar app for on-device dictation and meeting notes that save to Apple Notes. Everything runs locally. Uses speaker diarization. |
+| **[Logue](https://github.com/bitwize-ai/Logue)** | ✓ | Privacy-first AI meeting notes and writing assistant for macOS. Records mic + system audio and transcribes locally on Apple Silicon, with speaker diarization, Smart Minutes, and an on-device AI writing editor — nothing leaves the Mac. Uses FluidAudio streaming Sortformer speaker diarization. |
+| **[Goodmeet](https://goodmeet.com/)** | — | The AI note-taker that puts your privacy first. Uses FluidAudio models for VAD and transcription. |
+| **[Subtitles](https://subtitles-live.com/)** | [✓](https://github.com/daformat/subtitles) | Live captions for anything your Mac plays: meetings and calls, videos, podcasts and lectures, drawn as an always-on-top overlay that stays put while you switch apps. Captures system audio with a Core Audio process tap and transcribes entirely on-device, with selectable latency and optional speaker breaks. Uses Parakeet EOU and Nemotron streaming ASR, Silero VAD, and Sortformer speaker diarization on the Apple Neural Engine. |
+| **[Transkript](https://www.transkript.nl/)** | — | Offline AI transcription assistant for iPhone, iPad, and Mac. Transcribes audio/video files and live recordings in 25+ European languages, with color-coded speaker labels, AI summaries, translations, and subtitle export. Uses FluidAudio for ASR and speaker diarization. |
+| **[Notiva](https://trynotiva.com/)** | — | Menu-bar notes app for Mac meetings. Live on-device transcription on the Neural Engine with speaker diarization, merged with your own notes into a single document. Uses FluidAudio for transcription and speaker diarization. |
+| **[oats](https://github.com/ariso-ai/oats)** | ✓ | Open-source (MIT) meeting notes app for macOS and Windows built with Tauri and Vue. One-click recording, real-time transcription with speaker labels, and on-device LLM note generation in Markdown. Uses FluidAudio on the Apple Neural Engine for macOS transcription. |
+| **[Orca One](https://orcaone.com/)** | — | Private Mac dictation and meeting transcription with on-device processing. Uses FluidAudio's Parakeet ASR and Silero VAD. |
+| **[Banter](https://github.com/arvindvenkataramani/banter)** | ✓ | Open-source (Apache-2.0), self-hosted voice interface for OpenClaw, adaptable to other agent harnesses. Runs in the browser on desktop or phone. Its two Swift servers put FluidAudio behind OpenAI-compatible HTTP and streaming WebSocket APIs: Parakeet TDT v3, Parakeet Unified and Nemotron streaming ASR, and Pocket TTS, Kokoro and LuxTTS for speech, all on Apple Silicon. |
+| **[Wisp](https://smw.ai/projects/wisp)** | — | FREE, ultrafast English dictation for Mac that puts cleaned-up text in your app in 200-300ms after you stop talking. 3-10× faster than Wispr Flow, Superwhisper, MacWhisper, or OpenAI's GPT Transcribe, and nothing leaves your Mac. Uses Parakeet Unified ASR. |
+
+More apps built with FluidAudio are listed in [Documentation/Showcase.md](Documentation/Showcase.md).
 
 ## Installation
 
@@ -134,7 +164,7 @@ Enhance ASR output with post-processing:
 
 | Tool | Description | Language |
 |------|-------------|----------|
-| **[text-processing-rs](https://github.com/FluidInference/text-processing-rs)** | Inverse Text Normalization (ITN) and Text Normalization (TN) across 7 languages (EN, DE, ES, FR, HI, JA, ZH). 100% NeMo test compatibility (3,011 tests). Converts spoken-form ASR output to written form ("two hundred" → "200", "five dollars" → "$5"). Rust port of [NVIDIA NeMo Text Processing](https://github.com/NVIDIA/NeMo-text-processing) with Swift wrapper. | Rust, Swift |
+| **[text-processing-rs](https://github.com/FluidInference/text-processing-rs)** | ✓ | Inverse Text Normalization (ITN) and Text Normalization (TN) across 7 languages (EN, DE, ES, FR, HI, JA, ZH). 100% NeMo test compatibility (3,011 tests). Converts spoken-form ASR output to written form ("two hundred" → "200", "five dollars" → "$5"). Rust port of [NVIDIA NeMo Text Processing](https://github.com/NVIDIA/NeMo-text-processing) with Swift wrapper. | Rust, Swift |
 
 ## Configuration
 
@@ -165,9 +195,18 @@ import FluidAudio
 // Set custom registry before using any managers
 ModelRegistry.baseURL = "https://your-mirror.example.com"
 
+// Only needed when the mirror does not preserve an upstream pinned commit.
+ModelRegistry.revisionOverrides = [
+    "FluidInference/speaker-diarization-coreml": "your-mirror-revision"
+]
+
 // Models will now download from the custom registry
 let diarizer = DiarizerManager()
 ```
+
+Mirrors should preserve upstream Git revisions when possible. For repositories
+that FluidAudio pins to an immutable commit, set `revisionOverrides` explicitly
+if the mirror exposes the same files under a different branch, tag, or commit.
 
 **Environment Variables (recommended for CLI/testing):**
 ```bash
@@ -211,6 +250,30 @@ swift run fluidaudiocli transcribe audio.wav
 
 </details>
 
+<details>
+<summary><b>Offline-only mode</b> - Refuse every network fetch, bundle your own models</summary>
+
+If your application ships pre-downloaded model assets and never wants FluidAudio to reach HuggingFace at runtime (privacy-sensitive desktop apps, air-gapped deployments, kiosk builds), set the static `ModelHub.offlineMode` flag at startup:
+
+```swift
+import FluidAudio
+
+// Set once before any FluidAudio loader runs.
+ModelHub.offlineMode = true
+
+// Load via manual APIs that read from your bundled directory:
+let asr = try await AsrModels.load(from: bundledModelURL, configuration: config)
+```
+
+When the flag is on:
+- `fetchWithAuth`, `download`, and `fetchFile` throw `DownloadError.networkDisabled(operation:)` instead of touching the network.
+- `loadModels` short-circuits its retry-with-redownload fallback so a corrupt-detected `.mlmodelc` surfaces the original load error instead of silently re-fetching.
+- If `loadModels` is invoked but required files are missing from the local directory, `DownloadError.modelMissing(repo:missing:)` is thrown with the missing file list so the caller can ship a fix.
+
+The default is `false` — no behaviour change for existing callers. Combine with a custom `ModelRegistry.baseURL` only if you want offline-mode + a typed offline error rather than relying on a mirror URL.
+
+</details>
+
 ## Documentation
 
 **[DeepWiki](https://deepwiki.com/FluidInference/FluidAudio)** for auto-generated docs for this repo.
@@ -229,8 +292,10 @@ swift run fluidaudiocli transcribe audio.wav
     - [Speaker Diarization Guide](Documentation/Diarization/GettingStarted.md)
   - VAD: [Getting Started](Documentation/VAD/GettingStarted.md)
     - [Segmentation](Documentation/VAD/Segmentation.md)
+  - Speech Enhancement: [LocalVQE (AEC + NS)](Documentation/Enhancement/LocalVQE.md)
     - [Model Conversion Code](https://github.com/FluidInference/mobius)
 - [Benchmarks](Documentation/Benchmarks.md)
+- [CUA-S1-FORMS decision scoring](Documentation/API.md#decision-scoring)
 - [API Reference](Documentation/API.md)
 - [Command Line Guide](Documentation/CLI.md)
 
@@ -257,11 +322,14 @@ claude mcp add -s user -t http deepwiki https://mcp.deepwiki.com/mcp
 ## Automatic Speech Recognition (ASR) / Transcription
 
 - **Models**:
-  - `FluidInference/parakeet-tdt-0.6b-v3-coreml` (multilingual, 25 European languages)
+  - `FluidInference/parakeet-ultra-coreml` (multilingual, 25 European languages; recommended — more accurate than v3 at the same speed, see [Parakeet Ultra](Documentation/ASR/ParakeetUltra.md))
+  - `FluidInference/parakeet-tdt-0.6b-v3-coreml` (multilingual, 25 European languages; library default)
+  - `FluidInference/parakeet-redux-coreml` (multilingual, smallest download at ~220 MB; iOS 18+ / macOS 15+ only, see [Parakeet Redux](Documentation/ASR/ParakeetRedux.md))
   - `FluidInference/parakeet-tdt-0.6b-v2-coreml` (English-only, highest recall)
+  - `FluidInference/phonon-2-coreml` (English-only; Fermion Research's five-value re-training of v3, iOS 18+ / macOS 15+, see [Phonon-2](Documentation/ASR/Phonon2.md))
 - **Processing Mode**: Batch transcription for complete audio files
 - **Real-time Factor**: ~190x on M4 Pro (processes 1 hour of audio in ~19 seconds)
-- **Streaming Support**: Real-time streaming via `StreamingAsrManager` with sliding window processing and cancellation support
+- **Streaming Support**: Real-time streaming via `SlidingWindowAsrManager` with sliding window processing and cancellation support
 - **Backend**: Same Parakeet TDT v3 model powers our backend ASR
 
 ### ASR Quick Start
@@ -272,9 +340,9 @@ import FluidAudio
 // Batch transcription from an audio file
 Task {
     // 1) Initialize ASR manager and load models
-    let models = try await AsrModels.downloadAndLoad(version: .v3)  // Switch to .v2 for English-only work
+    let models = try await AsrModels.downloadAndLoad(version: .ultra)  // .v3 is the default; .v2 for English-only
     let asrManager = AsrManager(config: .default)
-    try await asrManager.initialize(models: models)
+    try await asrManager.loadModels(models)
 
     // 3) Transcribe the audio 16hz, already converted
     let result = try await asrManager.transcribe(samples)
@@ -348,14 +416,15 @@ End-to-end streaming diarization with CoreML inference. Default choice for onlin
 import FluidAudio
 
 Task {
-    let diarizer = LSEENDDiarizer()
-    try await diarizer.initialize(variant: .dihard3)
+    let diarizer = try await LSEENDDiarizer(variant: .dihard3)
 
     let samples = try await loadSamples16kMono(path: "path/to/meeting.wav")
     let timeline = try diarizer.processComplete(samples, sourceSampleRate: 16_000)
 
-    for segment in timeline.segments {
-        print("Speaker \(segment.speakerId): \(segment.startTimeSeconds)s - \(segment.endTimeSeconds)s")
+    for speaker in timeline.speakers.values {
+        for segment in speaker.finalizedSegments {
+            print("Speaker \(speaker.index): \(segment.startTime)s - \(segment.endTime)s")
+        }
     }
 }
 ```
@@ -368,7 +437,7 @@ Both LS-EEND and Sortformer emit results into a `DiarizerTimeline` with ultra-lo
 
 ### Streaming/Online Speaker Diarization (Pyannote)
 
-This pipeline uses segmentation plus speaker embeddings and is the third choice behind LS-EEND and Sortformer. It can be useful if you specifically want the classic multi-stage pipeline, but it is much slower than LS-EEND or Sortformer for live diarization.
+Pyannote 3.1 pipeline (segmentation + WeSpeaker embeddings) for online/streaming diarization. This is the third choice behind LS-EEND and Sortformer. It can be useful if you specifically want the classic multi-stage pipeline, but it is much slower than LS-EEND or Sortformer for live diarization.
 
 Why use the WeSpeaker/Pyannote pipeline:
 - More modular pipeline if you want separate segmentation and embedding stages
@@ -530,6 +599,33 @@ swift run fluidaudiocli vad-benchmark --num-files 50 --threshold 0.3
 negative-threshold overrides, max-speech splitting, padding, and chunk size.
 Offline mode also reports RTFx using the model's per-chunk processing time.
 
+## Speech Enhancement (Echo Cancellation + Noise Suppression)
+
+> **⚠️ Beta:** port fidelity validated (scores identically to the upstream GGML engine on the 800-clip AEC-Challenge blind set); the published table is only partially reproduced, with unresolved v1.2 far-end values and an ambiguous ERLE protocol. Not yet exercised in production call pipelines.
+
+[LocalVQE](https://github.com/localai-org/LocalVQE) (Apache-2.0) is a compact
+neural acoustic echo canceller + noise suppressor + dereverberator for 16 kHz
+speech. Feed it the mic capture and a far-end reference (what the speaker
+played) and it returns clean near-end speech, sample-aligned with the input.
+Two checkpoints (v1.3 4.8M, v1.2 1.3M) in 256 ms and 16 ms chunk exports;
+36× / 14× real-time on CPU for v1.3. On an exploratory AEC-Challenge synthetic
+subset v1.3 lifts ASR near-end word recall from 44.1% to 77.6% and cuts
+far-end word leakage from 34.0% to 1.1%. See
+[Documentation/Enhancement/LocalVQE.md](Documentation/Enhancement/LocalVQE.md).
+
+```swift
+let vqe = try await LocalVqeManager()
+let clean = try await vqe.process(mic: micSamples, reference: farEndSamples)
+
+// Live capture: push buffers of any size, 16 ms algorithmic latency
+let stream = try await LocalVqeManager(config: LocalVqeConfig(chunk: .realtime16ms)).makeStream()
+let out = try await stream.enhance(mic: micBuffer, reference: refBuffer)
+```
+
+```bash
+swift run -c release fluidaudiocli enhance mic.wav --reference speaker.wav --output clean.wav
+```
+
 ## Text‑To‑Speech (TTS)
 
 > **⚠️ Beta:** TTS currently supports American English only. Additional language support is planned.
@@ -549,45 +645,59 @@ FluidAudio ships two TTS backends:
 ### PocketTTS
 
 Streaming-friendly TTS with voice cloning support from short audio samples.
+Available language packs: `english` (default), `german`, `german_24l`,
+`italian`, `italian_24l`, `portuguese`, `portuguese_24l`, `spanish`,
+`spanish_24l`, `french_24l` (24-layer only — no 6-layer French upstream).
 
 ```swift
 import FluidAudio
 
 Task {
-    let manager = try await PocketTtsManager()
-    let audioData = try await manager.synthesize("Hello from FluidAudio.")
+    let manager = PocketTtsManager(language: .spanish)
+    try await manager.initialize()
+    let audioData = try await manager.synthesize(text: "Hola, mundo.")
     try audioData.write(to: URL(fileURLWithPath: "out.wav"))
 }
 ```
 
 ```bash
-# Synthesize with default voice
+# English (default)
 swift run fluidaudiocli tts "Hello from FluidAudio." --output out.wav --backend pocket
 
-# Clone a voice from an audio sample
+# Other languages
+swift run fluidaudiocli tts "Hola mundo" --backend pocket --language spanish --output es.wav
+swift run fluidaudiocli tts "Bonjour" --backend pocket --language french_24l --output fr.wav
+
+# Clone a voice from an audio sample (works with any language pack)
 swift run fluidaudiocli tts "Hello world." --output out.wav --backend pocket --clone-voice speaker.wav
 ```
 
-### Kokoro
+See [Documentation/TTS/PocketTTS.md](Documentation/TTS/PocketTTS.md#languages)
+for the full language table.
 
-High-quality parallel TTS with SSML and phoneme-level pronunciation control. Uses a CoreML G2P (grapheme-to-phoneme) model for out-of-vocabulary words — no external dependencies required.
+### KokoroAne
+
+ANE-resident Kokoro 82M (4-stage on Neural Engine, 3-stage on GPU). Yields
+3-11× RTFx on Apple Silicon vs. the prior single-graph Kokoro path. English
+(`af_heart`) and Mandarin variants ship with a built-in G2P pipeline (BART
+CoreML for English OOV, jieba + sandhi + G2pW for Mandarin).
 
 ```swift
 import FluidAudio
 
 Task {
-    let manager = KokoroTtsManager()
+    let manager = KokoroAneManager()
     try await manager.initialize()
-    let data = try await manager.synthesize(text: "Hello from FluidAudio.")
-    try data.write(to: URL(fileURLWithPath: "out.wav"))
+    let samples = try await manager.synthesize(text: "Hello from FluidAudio.")
+    // `samples` is 24 kHz mono Float32 PCM
 }
 ```
 
 ```bash
-swift run fluidaudiocli tts "Hello from FluidAudio." --auto-download --output out.wav
+swift run fluidaudiocli tts "Hello from FluidAudio." --backend kokoroAne --output out.wav
 ```
 
-Dictionary and model assets are cached under `~/.cache/fluidaudio/Models/kokoro`.
+Model assets are cached under `~/.cache/fluidaudio/Models/kokoro/`.
 
 ## Continuous Integration
 
@@ -702,3 +812,5 @@ Or use one of these code snippets:
 ```
 
 </details>
+
+Compatible community weights, including Orukeet, can use the [explicit local Core ML loader](Documentation/Orukeet.md).

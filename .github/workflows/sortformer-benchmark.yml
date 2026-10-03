@@ -36,13 +36,19 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/Library/Application Support/FluidAudio/Models/diar-streaming-sortformer-coreml
-          key: ${{ runner.os }}-sortformer-models-high-latency
+          key: ${{ runner.os }}-sortformer-models-high-latency-${{ hashFiles('Sources/FluidAudio/Shared/Download/**') }}
 
       - name: Cache AMI dataset
         uses: actions/cache@v4
         with:
           path: ~/FluidAudioDatasets/ami_official
           key: ${{ runner.os }}-ami-dataset
+
+      - name: Cache AMI annotations
+        uses: actions/cache@v4
+        with:
+          path: Datasets/ami_public_1.6.2
+          key: ${{ runner.os }}-ami-annotations-1.6.2
 
       - name: Build package
         run: swift build -c release
@@ -114,6 +120,13 @@ jobs:
           echo "RTF=${RTF}" >> $GITHUB_OUTPUT
           echo "DETECTED=${DETECTED}" >> $GITHUB_OUTPUT
           echo "GROUND_TRUTH=${GROUND_TRUTH}" >> $GITHUB_OUTPUT
+
+          # Validate RTFx - 0 indicates benchmark failure
+          if [ "$RTF" = "0" ] || [ -z "$RTF" ]; then
+            echo "❌ CRITICAL: RTFx is 0 or empty - benchmark failed"
+            echo "RTFx value: $RTF"
+            exit 1
+          fi
 
       - name: Comment PR with Benchmark Results
         if: always()

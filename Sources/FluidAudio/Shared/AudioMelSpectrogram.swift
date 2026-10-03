@@ -28,12 +28,12 @@ public final class AudioMelSpectrogram {
 
     // Config
     private let sampleRate: Int
-    private let nFFT: Int
-    private let hopLength: Int  // window_stride * sample_rate
-    private let winLength: Int  // window_size * sample_rate
+    public let nFFT: Int
+    public let hopLength: Int  // window_stride * sample_rate
+    public let winLength: Int  // window_size * sample_rate
     private let fMin: Float = 0.0
     private let fMax: Float  // sample_rate / 2
-    private let preemph: Float  // NeMo preemphasis coefficient
+    internal let preemph: Float  // NeMo preemphasis coefficient
     private let logFloor: Float
     private let logFloorMode: LogFloorMode
     private let padValue: Float = 0
@@ -56,13 +56,16 @@ public final class AudioMelSpectrogram {
     private var imagSq: [Float]
     private var frame: [Float]
 
+    /// NeMo's default pre-emphasis coefficient.
+    public static let defaultPreemph: Float = 0.97
+
     public init(
         sampleRate: Int = 16000,
         nMels: Int = 128,
         nFFT: Int = 512,
         hopLength: Int = 160,
         winLength: Int = 400,
-        preemph: Float = 0.97,
+        preemph: Float = AudioMelSpectrogram.defaultPreemph,
         padTo: Int = 0,
         logFloor: Float = powf(2, -24),
         logFloorMode: LogFloorMode = .additive,
@@ -190,7 +193,11 @@ public final class AudioMelSpectrogram {
         C.Element == Float, C.Index == Int
     {
         let audioCount = audio.count
-        let numFrames = audioCount / hopLength
+        // Frame count matches NeMo's center-padded mel: audio is zero-padded by nFFT/2 on each side
+        // before windowing, so numFrames = 1 + (paddedCount - winLength) / hopLength.
+        let padLength = nFFT / 2
+        let paddedCount = audioCount + 2 * padLength
+        let numFrames = 1 + (paddedCount - winLength) / hopLength
 
         guard numFrames > 0, let firstSample = audio.first else {
             return (mel: [Float](repeating: padValue, count: nMels), melLength: 0, numFrames: 1)
@@ -202,8 +209,6 @@ public final class AudioMelSpectrogram {
         // Step 1: Apply preemphasis filter using vDSP (y[n] = x[n] - preemph * x[n-1])
         // This will be copied into an already padded buffer to save time.
 
-        let padLength = nFFT / 2
-        let paddedCount = audioCount + 2 * padLength
         var paddedAudio = [Float](repeating: 0, count: paddedCount)
 
         paddedAudio[padLength] = firstSample - preemph * lastAudioSample
@@ -334,7 +339,11 @@ public final class AudioMelSpectrogram {
         let computedFrames: Int
         switch paddingMode {
         case .center:
-            computedFrames = audioCount / hopLength
+            // Frame count matches NeMo's center-padded mel: audio is zero-padded by nFFT/2 on each side
+            // before windowing, so numFrames = 1 + (paddedCount - winLength) / hopLength.
+            let padLength = nFFT / 2
+            let paddedCount = audioCount + 2 * padLength
+            computedFrames = 1 + (paddedCount - winLength) / hopLength
         case .prePadded:
             computedFrames = max(0, (audioCount - nFFT) / hopLength + 1)
         }

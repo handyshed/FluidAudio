@@ -1,14 +1,14 @@
 @preconcurrency import CoreML
 import Foundation
-import OSLog
 
 /// PocketTTS flow-matching language model synthesizer.
 ///
 /// Generates audio autoregressively: each generation step produces
 /// an 80ms audio frame (1920 samples at 24kHz).
 ///
-/// Long text is split into sentence-based chunks (≤50 tokens each)
-/// to stay within the KV cache limit (512 positions).
+/// Long text is split into sentence-based chunks. Separate sentences target
+/// 50 tokens per chunk, while longer sentences stay whole when the selected
+/// voice leaves enough KV-cache capacity for their text and generated audio.
 ///
 /// Pipeline: text → chunk → [tokenize → embed → prefill KV → generate → flow decode → mimi decode] → WAV
 public struct PocketTtsSynthesizer {
@@ -52,143 +52,20 @@ public struct PocketTtsSynthesizer {
         voice: String = PocketTtsConstants.defaultVoice,
         temperature: Float = PocketTtsConstants.temperature,
         seed: UInt64? = nil,
-        deEss: Bool = true
+        deEss: Bool = true,
+        maxTokensPerChunk: Int = PocketTtsConstants.maxTokensPerChunk,
+        language: PocketTtsLanguage = .english
     ) async throws -> SynthesisResult {
         let store = try currentModelStore()
-
-        logger.info("PocketTTS synthesizing: '\(text)'")
-
-        // 1. Load constants and voice
-        let constants = try await store.constants()
         let voiceData = try await store.voiceData(for: voice)
-
-        // 2. Split text into chunks that fit within KV cache capacity
-        let chunks = chunkText(text, tokenizer: constants.tokenizer)
-        logger.info("Split into \(chunks.count) chunk(s)")
-
-        // 3. Set up random number generator (seeded or system entropy)
-        var rng = SeededRNG(seed: seed ?? UInt64.random(in: 0...UInt64.max))
-
-        // 4. Load models
-        let condModel = try await store.condStep()
-        let stepModel = try await store.flowlmStep()
-        let flowModel = try await store.flowDecoder()
-        let mimiModel = try await store.mimiDecoder()
-
-        // 5. Load Mimi initial state (continuous across chunks)
-        let repoDir = try await store.repoDir()
-        var mimiState = try loadMimiInitialState(from: repoDir)
-
-        // 6. Create BOS embedding
-        let bosEmb = try createBosEmbedding(constants.bosEmbedding)
-
-        // 7. Generate audio for each chunk
-        var audioChunks: [[Float]] = []
-        var lastEosStep: Int?
-
-        let genStart = Date()
-
-        for (chunkIdx, chunkText) in chunks.enumerated() {
-            let (normalizedChunk, framesAfterEos) = normalizeText(chunkText)
-            logger.info("Chunk \(chunkIdx + 1)/\(chunks.count): '\(normalizedChunk)'")
-
-            // Tokenize and embed this chunk
-            let tokenIds = constants.tokenizer.encode(normalizedChunk)
-            let textEmbeddings = embedTokens(tokenIds, constants: constants)
-
-            // Fresh KV cache per chunk
-            let prefillStart = Date()
-            var kvState = try await prefillKVCache(
-                voiceData: voiceData,
-                textEmbeddings: textEmbeddings,
-                model: condModel
-            )
-            let prefillElapsed = Date().timeIntervalSince(prefillStart)
-            logger.info(
-                "Chunk \(chunkIdx + 1) prefill: \(String(format: "%.2f", prefillElapsed))s (\(tokenIds.count) tokens)"
-            )
-
-            // Generation loop for this chunk
-            let maxGenLen = estimateMaxFrames(text: chunkText)
-            var eosStep: Int?
-            var sequence = try createNaNSequence()
-            let totalFramesAfterEos =
-                framesAfterEos + PocketTtsConstants.extraFramesAfterDetection
-
-            for step in 0..<maxGenLen {
-                let (transformerOut, eosLogit) = try await runFlowLMStep(
-                    sequence: sequence,
-                    bosEmb: bosEmb,
-                    state: &kvState,
-                    model: stepModel
-                )
-
-                if eosLogit > PocketTtsConstants.eosThreshold && eosStep == nil {
-                    eosStep = step
-                    logger.info("Chunk \(chunkIdx + 1) EOS at step \(step)")
-                }
-                if let eos = eosStep, step >= eos + totalFramesAfterEos {
-                    break
-                }
-
-                let latent = try await flowDecode(
-                    transformerOut: transformerOut,
-                    numSteps: PocketTtsConstants.numLsdSteps,
-                    temperature: temperature,
-                    model: flowModel,
-                    rng: &rng
-                )
-
-                // Mimi state is continuous across chunks
-                // (denormalize + quantize baked into mimi_decoder model)
-                let frameSamples = try await runMimiDecoder(
-                    latent: latent,
-                    state: &mimiState,
-                    model: mimiModel
-                )
-                audioChunks.append(frameSamples)
-
-                sequence = try createSequenceFromLatent(latent)
-
-                if step % 20 == 0 {
-                    logger.info("Chunk \(chunkIdx + 1) step \(step)...")
-                }
-            }
-
-            lastEosStep = eosStep
-        }
-
-        let genElapsed = Date().timeIntervalSince(genStart)
-        logger.info(
-            "Generated \(audioChunks.count) frames in \(String(format: "%.2f", genElapsed))s")
-
-        // 8. Concatenate audio (no peak normalization — preserve natural levels)
-        var allSamples = audioChunks.flatMap { $0 }
-
-        // De-essing
-        if deEss {
-            AudioPostProcessor.applyTtsPostProcessing(
-                &allSamples,
-                sampleRate: Float(PocketTtsConstants.audioSampleRate),
-                deEssAmount: -3.0,
-                smoothing: false
-            )
-        }
-
-        // 9. Encode WAV
-        let audioData = try AudioWAV.data(
-            from: allSamples,
-            sampleRate: Double(PocketTtsConstants.audioSampleRate)
-        )
-
-        let duration = Double(allSamples.count) / Double(PocketTtsConstants.audioSampleRate)
-        logger.info("Audio duration: \(String(format: "%.2f", duration))s")
-
-        return SynthesisResult(
-            audio: audioData,
-            samples: allSamples,
-            frameCount: audioChunks.count,
-            eosStep: lastEosStep
+        return try await synthesize(
+            text: text,
+            voiceData: voiceData,
+            temperature: temperature,
+            seed: seed,
+            deEss: deEss,
+            maxTokensPerChunk: maxTokensPerChunk,
+            language: language
         )
     }
 
@@ -208,120 +85,35 @@ public struct PocketTtsSynthesizer {
         voiceData: PocketTtsVoiceData,
         temperature: Float = PocketTtsConstants.temperature,
         seed: UInt64? = nil,
-        deEss: Bool = true
+        deEss: Bool = true,
+        maxTokensPerChunk: Int = PocketTtsConstants.maxTokensPerChunk,
+        language: PocketTtsLanguage = .english
     ) async throws -> SynthesisResult {
-        let store = try currentModelStore()
-
         logger.info("PocketTTS synthesizing with custom voice: '\(text)'")
-
-        // 1. Load constants (voice provided directly)
-        let constants = try await store.constants()
-
-        // 2. Split text into chunks that fit within KV cache capacity
-        let chunks = chunkText(text, tokenizer: constants.tokenizer)
-        logger.info("Split into \(chunks.count) chunk(s)")
-
-        // 3. Set up random number generator (seeded or system entropy)
-        var rng = SeededRNG(seed: seed ?? UInt64.random(in: 0...UInt64.max))
-
-        // 4. Load models
-        let condModel = try await store.condStep()
-        let stepModel = try await store.flowlmStep()
-        let flowModel = try await store.flowDecoder()
-        let mimiModel = try await store.mimiDecoder()
-
-        // 5. Load Mimi initial state (continuous across chunks)
-        let repoDir = try await store.repoDir()
-        var mimiState = try loadMimiInitialState(from: repoDir)
-
-        // 6. Create BOS embedding
-        let bosEmb = try createBosEmbedding(constants.bosEmbedding)
-
-        // 7. Generate audio for each chunk
-        var audioChunks: [[Float]] = []
-        var lastEosStep: Int?
-
         let genStart = Date()
 
-        for (chunkIdx, chunkText) in chunks.enumerated() {
-            let (normalizedChunk, framesAfterEos) = normalizeText(chunkText)
-            logger.info("Chunk \(chunkIdx + 1)/\(chunks.count): '\(normalizedChunk)'")
+        // Buffer the streaming output. Both APIs share one chunk loop now,
+        // so any change to prefill/generation logic only needs to land once.
+        let stream = try await synthesizeStreaming(
+            text: text,
+            voiceData: voiceData,
+            temperature: temperature,
+            seed: seed,
+            maxTokensPerChunk: maxTokensPerChunk,
+            language: language
+        )
 
-            // Tokenize and embed this chunk
-            let tokenIds = constants.tokenizer.encode(normalizedChunk)
-            let textEmbeddings = embedTokens(tokenIds, constants: constants)
-
-            // Fresh KV cache per chunk
-            let prefillStart = Date()
-            var kvState = try await prefillKVCache(
-                voiceData: voiceData,
-                textEmbeddings: textEmbeddings,
-                model: condModel
-            )
-            let prefillElapsed = Date().timeIntervalSince(prefillStart)
-            logger.info(
-                "Chunk \(chunkIdx + 1) prefill: \(String(format: "%.2f", prefillElapsed))s (\(tokenIds.count) tokens)"
-            )
-
-            // Generation loop for this chunk
-            let maxGenLen = estimateMaxFrames(text: chunkText)
-            var eosStep: Int?
-            var sequence = try createNaNSequence()
-            let totalFramesAfterEos =
-                framesAfterEos + PocketTtsConstants.extraFramesAfterDetection
-
-            for step in 0..<maxGenLen {
-                let (transformerOut, eosLogit) = try await runFlowLMStep(
-                    sequence: sequence,
-                    bosEmb: bosEmb,
-                    state: &kvState,
-                    model: stepModel
-                )
-
-                if eosLogit > PocketTtsConstants.eosThreshold && eosStep == nil {
-                    eosStep = step
-                    logger.info("Chunk \(chunkIdx + 1) EOS at step \(step)")
-                }
-
-                if let eos = eosStep, step >= eos + totalFramesAfterEos {
-                    break
-                }
-
-                let latent = try await flowDecode(
-                    transformerOut: transformerOut,
-                    numSteps: PocketTtsConstants.numLsdSteps,
-                    temperature: temperature,
-                    model: flowModel,
-                    rng: &rng
-                )
-
-                // Mimi state is continuous across chunks
-                // (denormalize + quantize baked into mimi_decoder model)
-                let frameSamples = try await runMimiDecoder(
-                    latent: latent,
-                    state: &mimiState,
-                    model: mimiModel
-                )
-                audioChunks.append(frameSamples)
-
-                sequence = try createSequenceFromLatent(latent)
-
-                if step % 20 == 0 {
-                    logger.info("Chunk \(chunkIdx + 1) step \(step)...")
-                }
-            }
-
-            lastEosStep = eosStep
+        var allSamples: [Float] = []
+        var frameCount = 0
+        for try await frame in stream {
+            allSamples.append(contentsOf: frame.samples)
+            frameCount += 1
         }
 
         let genElapsed = Date().timeIntervalSince(genStart)
-        logger.info(
-            "Generated \(audioChunks.count) frames in \(String(format: "%.2f", genElapsed))s")
+        logger.info("Generated \(frameCount) frames in \(String(format: "%.2f", genElapsed))s")
 
-        // 8. Concatenate audio (no peak normalization — preserve natural levels)
-        var allSamples = audioChunks.flatMap { $0 }
-
-        // De-essing
+        // De-essing (no peak normalization — preserve natural levels)
         if deEss {
             AudioPostProcessor.applyTtsPostProcessing(
                 &allSamples,
@@ -331,7 +123,7 @@ public struct PocketTtsSynthesizer {
             )
         }
 
-        // 9. Encode WAV
+        // Encode WAV
         let audioData = try AudioWAV.data(
             from: allSamples,
             sampleRate: Double(PocketTtsConstants.audioSampleRate)
@@ -343,8 +135,8 @@ public struct PocketTtsSynthesizer {
         return SynthesisResult(
             audio: audioData,
             samples: allSamples,
-            frameCount: audioChunks.count,
-            eosStep: lastEosStep
+            frameCount: frameCount,
+            eosStep: nil
         )
     }
 
@@ -360,8 +152,11 @@ public struct PocketTtsSynthesizer {
         public let frameIndex: Int
         /// Zero-based index of the text chunk being synthesized.
         public let chunkIndex: Int
-        /// Total number of text chunks.
+        /// Total number of text chunks for the current utterance.
         public let chunkCount: Int
+        /// Zero-based index of the enqueued utterance that produced this frame.
+        /// Only set in session mode; `nil` for one-shot and streaming synthesis.
+        public let utteranceIndex: Int?
     }
 
     /// Synthesize audio as a stream of 80ms frames.
@@ -389,43 +184,20 @@ public struct PocketTtsSynthesizer {
         text: String,
         voice: String = PocketTtsConstants.defaultVoice,
         temperature: Float = PocketTtsConstants.temperature,
-        seed: UInt64? = nil
+        seed: UInt64? = nil,
+        maxTokensPerChunk: Int = PocketTtsConstants.maxTokensPerChunk,
+        language: PocketTtsLanguage = .english
     ) async throws -> AsyncThrowingStream<AudioFrame, Error> {
         let store = try currentModelStore()
-
-        logger.info("PocketTTS streaming synthesis: '\(text)'")
-
-        let constants = try await store.constants()
         let voiceData = try await store.voiceData(for: voice)
-        let chunks = chunkText(text, tokenizer: constants.tokenizer)
-        let condModel = try await store.condStep()
-        let stepModel = try await store.flowlmStep()
-        let flowModel = try await store.flowDecoder()
-        let mimiModel = try await store.mimiDecoder()
-        let repoDir = try await store.repoDir()
-        let mimiInitialState = try loadMimiInitialState(from: repoDir)
-        let bosEmb = try createBosEmbedding(constants.bosEmbedding)
-        let seedValue = seed ?? UInt64.random(in: 0...UInt64.max)
-        let chunkCount = chunks.count
-
-        logger.info("Streaming \(chunkCount) chunk(s)")
-
-        let generator = StreamingGenerator(
-            constants: constants,
+        return try await synthesizeStreaming(
+            text: text,
             voiceData: voiceData,
-            chunks: chunks,
-            condModel: condModel,
-            stepModel: stepModel,
-            flowModel: flowModel,
-            mimiModel: mimiModel,
-            mimiInitialState: mimiInitialState,
-            bosEmb: bosEmb,
-            seedValue: seedValue,
-            chunkCount: chunkCount,
-            temperature: temperature
+            temperature: temperature,
+            seed: seed,
+            maxTokensPerChunk: maxTokensPerChunk,
+            language: language
         )
-
-        return makeStream(generator: generator)
     }
 
     /// Synthesize audio as a stream using custom voice data.
@@ -443,20 +215,54 @@ public struct PocketTtsSynthesizer {
         text: String,
         voiceData: PocketTtsVoiceData,
         temperature: Float = PocketTtsConstants.temperature,
-        seed: UInt64? = nil
+        seed: UInt64? = nil,
+        maxTokensPerChunk: Int = PocketTtsConstants.maxTokensPerChunk,
+        language: PocketTtsLanguage = .english
     ) async throws -> AsyncThrowingStream<AudioFrame, Error> {
         let store = try currentModelStore()
 
         logger.info("PocketTTS streaming synthesis with custom voice: '\(text)'")
 
+        let voicePosition = voiceCachePosition(for: voiceData)
+        let effectiveMaxTokens = try effectiveMaxTokensPerChunk(
+            requested: maxTokensPerChunk,
+            voiceCachePosition: voicePosition
+        )
+
+        // `.aneState` runs on the Trial 23 MLState pipeline (one shared KV
+        // state instead of 24-tensor cache I/O) via a one-shot session.
+        if store.placement == .aneState {
+            return try await synthesizeStreamingStateful(
+                text: text,
+                voiceData: voiceData,
+                temperature: temperature,
+                seed: seed,
+                maxTokensPerChunk: effectiveMaxTokens,
+                language: language
+            )
+        }
+
         let constants = try await store.constants()
-        let chunks = chunkText(text, tokenizer: constants.tokenizer)
+        let chunks = chunkTextWithMetadata(
+            text, tokenizer: constants.tokenizer,
+            maxTokens: effectiveMaxTokens,
+            preferredMaxTokens: min(
+                PocketTtsConstants.preferredTokensPerChunk, effectiveMaxTokens),
+            voiceCachePosition: voicePosition,
+            language: language)
         let condModel = try await store.condStep()
+        let hasCondPrefill = await store.hasCondPrefill()
         let stepModel = try await store.flowlmStep()
         let flowModel = try await store.flowDecoder()
         let mimiModel = try await store.mimiDecoder()
+        let condLayerKeys = try await store.condStepLayerKeys()
+        let condPrefillLayerKeys = await store.condPrefillStepLayerKeys()
+        let useCondPrefill = hasCondPrefill && condPrefillLayerKeys != nil
+        let condPrefillModel = useCondPrefill ? try await store.condPrefill() : condModel
+        let flowlmLayerKeys = try await store.flowLMStepLayerKeys()
+        let mimiKeys = try await store.mimiDecoderKeys()
         let repoDir = try await store.repoDir()
-        let mimiInitialState = try loadMimiInitialState(from: repoDir)
+        let mimiInitialState = try loadMimiInitialState(from: repoDir, mimiKeys: mimiKeys)
         let bosEmb = try createBosEmbedding(constants.bosEmbedding)
         let seedValue = seed ?? UInt64.random(in: 0...UInt64.max)
         let chunkCount = chunks.count
@@ -466,17 +272,117 @@ public struct PocketTtsSynthesizer {
             voiceData: voiceData,
             chunks: chunks,
             condModel: condModel,
+            condPrefillModel: condPrefillModel,
+            useCondPrefill: useCondPrefill,
             stepModel: stepModel,
             flowModel: flowModel,
             mimiModel: mimiModel,
+            condLayerKeys: condLayerKeys,
+            condPrefillLayerKeys: condPrefillLayerKeys,
+            flowlmLayerKeys: flowlmLayerKeys,
+            mimiKeys: mimiKeys,
             mimiInitialState: mimiInitialState,
             bosEmb: bosEmb,
             seedValue: seedValue,
             chunkCount: chunkCount,
-            temperature: temperature
+            temperature: temperature,
+            language: language
         )
 
         return makeStream(generator: generator)
+    }
+
+    // MARK: - Session API
+
+    /// Create a persistent TTS session that keeps the voice KV cache warm.
+    ///
+    /// Performs the expensive voice prefill once (~125 tokens), then returns a
+    /// session where each enqueued utterance only pays the text prefill cost.
+    ///
+    /// Must be called within a `withModelStore` context.
+    static func makeSession(
+        voiceData: PocketTtsVoiceData,
+        temperature: Float = PocketTtsConstants.temperature,
+        seed: UInt64? = nil,
+        language: PocketTtsLanguage = .english
+    ) async throws -> PocketTtsSession {
+        let store = try currentModelStore()
+
+        // `.aneState` sessions run on the Trial 23 MLState pipeline; none of
+        // the IO models below exist in that configuration.
+        if store.placement == .aneState {
+            return try await makeStateSession(
+                voiceData: voiceData,
+                temperature: temperature,
+                seed: seed,
+                language: language
+            )
+        }
+
+        let constants = try await store.constants()
+        let condModel = try await store.condStep()
+        let hasCondPrefill = await store.hasCondPrefill()
+        let stepModel = try await store.flowlmStep()
+        let flowModel = try await store.flowDecoder()
+        let mimiModel = try await store.mimiDecoder()
+        let condLayerKeys = try await store.condStepLayerKeys()
+        let condPrefillLayerKeys = await store.condPrefillStepLayerKeys()
+        let useCondPrefill = hasCondPrefill && condPrefillLayerKeys != nil
+        let condPrefillModel = useCondPrefill ? try await store.condPrefill() : condModel
+        let flowlmLayerKeys = try await store.flowLMStepLayerKeys()
+        let mimiKeys = try await store.mimiDecoderKeys()
+        let repoDir = try await store.repoDir()
+        let mimiState = try loadMimiInitialState(from: repoDir, mimiKeys: mimiKeys)
+        let bosEmb = try createBosEmbedding(constants.bosEmbedding)
+        let seedValue = seed ?? UInt64.random(in: 0...UInt64.max)
+
+        // One-time voice prefill. Two paths matching `prefillKVCache`:
+        //  - Shipped voices (cacheSnapshot != nil): drop pre-baked K/V into
+        //    cache, skip cond_step entirely (`promptLength == 0`, so the
+        //    loop in `prefillKVCacheVoice` would be a no-op anyway).
+        //  - Cloned voices (flat audio prompt): feed `bos_before_voice`
+        //    plus every voice token through cond_step.
+        let voiceKVSnapshot: KVCacheState
+        if let snapshot = voiceData.cacheSnapshot {
+            voiceKVSnapshot = try kvCacheStateFromSnapshot(
+                snapshot, layers: condLayerKeys.layerCount, splitKV: condLayerKeys.isSplitKV)
+        } else {
+            let emptyState = try emptyKVCacheState(
+                layers: condLayerKeys.layerCount, splitKV: condLayerKeys.isSplitKV)
+            voiceKVSnapshot = try await prefillKVCacheVoice(
+                state: emptyState, voiceData: voiceData,
+                bosBeforeVoice: constants.bosBeforeVoice,
+                model: condModel, layerKeys: condLayerKeys,
+                prefillModel: condPrefillModel, prefillLayerKeys: condPrefillLayerKeys,
+                useFastPrefill: useCondPrefill
+            )
+        }
+
+        logger.info(
+            "Session voice prefill at position \(Int(voiceKVSnapshot.positions[0][0].floatValue))"
+        )
+
+        let session = try PocketTtsSession(
+            voiceKVSnapshot: voiceKVSnapshot,
+            mimiState: mimiState,
+            constants: constants,
+            condModel: condModel,
+            condPrefillModel: condPrefillModel,
+            useCondPrefill: useCondPrefill,
+            stepModel: stepModel,
+            flowModel: flowModel,
+            mimiModel: mimiModel,
+            condLayerKeys: condLayerKeys,
+            condPrefillLayerKeys: condPrefillLayerKeys,
+            flowlmLayerKeys: flowlmLayerKeys,
+            mimiKeys: mimiKeys,
+            bosEmb: bosEmb,
+            temperature: temperature,
+            seed: seedValue,
+            language: language
+        )
+        await session.start()
+        return session
     }
 
     // MARK: - Streaming Internals
@@ -489,43 +395,64 @@ public struct PocketTtsSynthesizer {
     private actor StreamingGenerator {
         let constants: PocketTtsConstantsBundle
         let voiceData: PocketTtsVoiceData
-        let chunks: [String]
+        let chunks: [TextChunk]
         let condModel: MLModel
+        let condPrefillModel: MLModel
+        let useCondPrefill: Bool
         let stepModel: MLModel
         let flowModel: MLModel
         let mimiModel: MLModel
+        let condLayerKeys: PocketTtsLayerKeys
+        let condPrefillLayerKeys: PocketTtsLayerKeys?
+        let flowlmLayerKeys: PocketTtsLayerKeys
+        let mimiKeys: PocketTtsMimiKeys
         var mimiState: MimiState
         let bosEmb: MLMultiArray
         var rng: SeededRNG
         let chunkCount: Int
         let temperature: Float
+        let language: PocketTtsLanguage
 
         init(
             constants: PocketTtsConstantsBundle,
             voiceData: PocketTtsVoiceData,
-            chunks: [String],
+            chunks: [TextChunk],
             condModel: MLModel,
+            condPrefillModel: MLModel,
+            useCondPrefill: Bool,
             stepModel: MLModel,
             flowModel: MLModel,
             mimiModel: MLModel,
+            condLayerKeys: PocketTtsLayerKeys,
+            condPrefillLayerKeys: PocketTtsLayerKeys?,
+            flowlmLayerKeys: PocketTtsLayerKeys,
+            mimiKeys: PocketTtsMimiKeys,
             mimiInitialState: MimiState,
             bosEmb: MLMultiArray,
             seedValue: UInt64,
             chunkCount: Int,
-            temperature: Float
+            temperature: Float,
+            language: PocketTtsLanguage
         ) {
             self.constants = constants
             self.voiceData = voiceData
             self.chunks = chunks
             self.condModel = condModel
+            self.condPrefillModel = condPrefillModel
+            self.useCondPrefill = useCondPrefill
             self.stepModel = stepModel
             self.flowModel = flowModel
             self.mimiModel = mimiModel
+            self.condLayerKeys = condLayerKeys
+            self.condPrefillLayerKeys = condPrefillLayerKeys
+            self.flowlmLayerKeys = flowlmLayerKeys
+            self.mimiKeys = mimiKeys
             self.mimiState = mimiInitialState
             self.bosEmb = bosEmb
             self.rng = SeededRNG(seed: seedValue)
             self.chunkCount = chunkCount
             self.temperature = temperature
+            self.language = language
         }
 
         /// Flow decode using actor-isolated RNG state.
@@ -538,7 +465,6 @@ public struct PocketTtsSynthesizer {
             var localRng = rng
             let result = try await PocketTtsSynthesizer.flowDecode(
                 transformerOut: transformerOut,
-                numSteps: PocketTtsConstants.numLsdSteps,
                 temperature: temperature,
                 model: flowModel,
                 rng: &localRng
@@ -556,7 +482,8 @@ public struct PocketTtsSynthesizer {
             let result = try await PocketTtsSynthesizer.runMimiDecoder(
                 latent: latent,
                 state: &localState,
-                model: mimiModel
+                model: mimiModel,
+                mimiKeys: mimiKeys
             )
             mimiState = localState
             return result
@@ -572,7 +499,8 @@ public struct PocketTtsSynthesizer {
                 sequence: sequence,
                 bosEmb: bosEmb,
                 state: &localState,
-                model: stepModel
+                model: stepModel,
+                layerKeys: flowlmLayerKeys
             )
             kvState = localState
             return result
@@ -582,9 +510,12 @@ public struct PocketTtsSynthesizer {
             continuation: AsyncThrowingStream<AudioFrame, Error>.Continuation
         ) async {
             do {
-                for (chunkIdx, chunkText) in chunks.enumerated() {
+                for (chunkIdx, chunk) in chunks.enumerated() {
                     let (normalizedChunk, framesAfterEos) =
-                        PocketTtsSynthesizer.normalizeText(chunkText)
+                        PocketTtsSynthesizer.normalizeText(
+                            chunk.text,
+                            isMidSentence: chunk.isMidSentence,
+                            language: language)
                     PocketTtsSynthesizer.logger.info(
                         "Stream chunk \(chunkIdx + 1)/\(chunkCount): '\(normalizedChunk)'"
                     )
@@ -596,12 +527,21 @@ public struct PocketTtsSynthesizer {
                     var kvState = try await PocketTtsSynthesizer.prefillKVCache(
                         voiceData: voiceData,
                         textEmbeddings: textEmbeddings,
-                        model: condModel
+                        bosBeforeVoice: constants.bosBeforeVoice,
+                        model: condModel,
+                        layerKeys: condLayerKeys,
+                        prefillModel: condPrefillModel,
+                        prefillLayerKeys: condPrefillLayerKeys,
+                        useFastPrefill: useCondPrefill
                     )
 
-                    let maxGenLen = PocketTtsSynthesizer.estimateMaxFrames(text: chunkText)
+                    let cachePosition = try PocketTtsSynthesizer.kvCachePosition(in: kvState)
+                    let maxGenLen = PocketTtsSynthesizer.boundedGenerationFrameCount(
+                        text: chunk.text, cachePosition: cachePosition)
                     var eosStep: Int?
-                    var sequence = try PocketTtsSynthesizer.createNaNSequence()
+                    var sequence = try PocketTtsSynthesizer.createBosStartSequence(
+                        bosEmbedding: constants.bosEmbedding,
+                        splitKV: flowlmLayerKeys.isSplitKV)
                     let totalFramesAfterEos =
                         framesAfterEos + PocketTtsConstants.extraFramesAfterDetection
 
@@ -633,10 +573,19 @@ public struct PocketTtsSynthesizer {
                                 samples: frameSamples,
                                 frameIndex: step,
                                 chunkIndex: chunkIdx,
-                                chunkCount: chunkCount
+                                chunkCount: chunkCount,
+                                utteranceIndex: nil
                             ))
 
                         sequence = try PocketTtsSynthesizer.createSequenceFromLatent(latent)
+                    }
+
+                    if !Task.isCancelled {
+                        try PocketTtsSynthesizer.validateGenerationCompleted(
+                            generatedFrameLimit: maxGenLen,
+                            cachePosition: cachePosition,
+                            eosStep: eosStep,
+                            framesAfterEos: totalFramesAfterEos)
                     }
 
                     if Task.isCancelled { break }
@@ -646,7 +595,140 @@ public struct PocketTtsSynthesizer {
                 continuation.finish(throwing: error)
             }
         }
+
+        /// Cross-engine pipelined variant of `generate`.
+        ///
+        /// The per-frame chain is flowlm(GPU) → flow(ANE) → latent → [fed back to
+        /// flowlm] + mimi(CPU). mimi's audio output feeds NOTHING back, so mimi[N]
+        /// can run concurrently with flowlm[N+1]+flow[N+1]. This moves mimi onto its
+        /// own actor + a detached consumer so the CPU decode overlaps the GPU/ANE
+        /// critical path → per-frame wall ≈ max(mimi, flowlm+flow) instead of the sum.
+        ///
+        /// OPT-IN and UNVERIFIED on-device (gated by
+        /// `PocketTtsSynthesizer.useCrossEnginePipeline`). Output is identical to
+        /// `generate`; only scheduling differs. Verify timing + ordering on-device
+        /// before making it the default.
+        func generatePipelined(
+            continuation: AsyncThrowingStream<AudioFrame, Error>.Continuation
+        ) async {
+            let mimi = MimiDecodeActor(
+                model: mimiModel, keys: mimiKeys, initialState: mimiState)
+            let totalChunks = chunkCount
+
+            struct LatentWork: Sendable {
+                let latent: [Float]
+                let frameIndex: Int
+                let chunkIndex: Int
+            }
+            let (latents, latentCont) = AsyncStream.makeStream(of: LatentWork.self)
+
+            // CONSUMER (detached → off this actor): decode each latent on the mimi
+            // actor (CPU) in order and yield audio. While it awaits mimi.decode,
+            // the producer below runs flowlm/flow on GPU/ANE — the overlap.
+            let consumer = Task.detached {
+                for await w in latents {
+                    if Task.isCancelled { break }
+                    let audio = try await mimi.decode(w.latent)
+                    continuation.yield(
+                        AudioFrame(
+                            samples: audio, frameIndex: w.frameIndex,
+                            chunkIndex: w.chunkIndex, chunkCount: totalChunks,
+                            utteranceIndex: nil))
+                }
+            }
+
+            // PRODUCER: flowlm(GPU)→flow(ANE) recurrence. Hands each latent off and
+            // continues immediately — never waits for mimi.
+            do {
+                for (chunkIdx, chunk) in chunks.enumerated() {
+                    if Task.isCancelled { break }
+                    let (normalizedChunk, framesAfterEos) =
+                        PocketTtsSynthesizer.normalizeText(
+                            chunk.text, isMidSentence: chunk.isMidSentence, language: language)
+                    let tokenIds = constants.tokenizer.encode(normalizedChunk)
+                    let textEmbeddings = PocketTtsSynthesizer.embedTokens(
+                        tokenIds, constants: constants)
+                    var kvState = try await PocketTtsSynthesizer.prefillKVCache(
+                        voiceData: voiceData, textEmbeddings: textEmbeddings,
+                        bosBeforeVoice: constants.bosBeforeVoice, model: condModel,
+                        layerKeys: condLayerKeys, prefillModel: condPrefillModel,
+                        prefillLayerKeys: condPrefillLayerKeys, useFastPrefill: useCondPrefill)
+
+                    let cachePosition = try PocketTtsSynthesizer.kvCachePosition(in: kvState)
+                    let maxGenLen = PocketTtsSynthesizer.boundedGenerationFrameCount(
+                        text: chunk.text, cachePosition: cachePosition)
+                    var eosStep: Int?
+                    var sequence = try PocketTtsSynthesizer.createBosStartSequence(
+                        bosEmbedding: constants.bosEmbedding,
+                        splitKV: flowlmLayerKeys.isSplitKV)
+                    let totalFramesAfterEos =
+                        framesAfterEos + PocketTtsConstants.extraFramesAfterDetection
+
+                    for step in 0..<maxGenLen {
+                        if Task.isCancelled { break }
+                        let (transformerOut, eosLogit) = try await flowLMStep(
+                            sequence: sequence, kvState: &kvState)
+                        if eosLogit > PocketTtsConstants.eosThreshold && eosStep == nil {
+                            eosStep = step
+                        }
+                        if let eos = eosStep, step >= eos + totalFramesAfterEos { break }
+                        let latent = try await flowDecodeStep(transformerOut: transformerOut)
+                        latentCont.yield(
+                            LatentWork(latent: latent, frameIndex: step, chunkIndex: chunkIdx))
+                        sequence = try PocketTtsSynthesizer.createSequenceFromLatent(latent)
+                    }
+                    if !Task.isCancelled {
+                        try PocketTtsSynthesizer.validateGenerationCompleted(
+                            generatedFrameLimit: maxGenLen,
+                            cachePosition: cachePosition,
+                            eosStep: eosStep,
+                            framesAfterEos: totalFramesAfterEos)
+                    }
+                    if Task.isCancelled { break }
+                }
+                latentCont.finish()
+                try await consumer.value
+                continuation.finish()
+            } catch {
+                latentCont.finish()
+                consumer.cancel()
+                continuation.finish(throwing: error)
+                return
+            }
+        }
     }
+
+    /// Mimi streaming codec on its own actor so its CPU decode runs concurrently
+    /// with the flowlm(GPU)→flow(ANE) critical path in `generatePipelined`.
+    private actor MimiDecodeActor {
+        private let model: MLModel
+        private let keys: PocketTtsMimiKeys
+        private var state: MimiState
+        init(model: MLModel, keys: PocketTtsMimiKeys, initialState: MimiState) {
+            self.model = model
+            self.keys = keys
+            self.state = initialState
+        }
+        func decode(_ latent: [Float]) async throws -> [Float] {
+            var local = state
+            let out = try await PocketTtsSynthesizer.runMimiDecoder(
+                latent: latent, state: &local, model: model, mimiKeys: keys)
+            state = local  // sequential codec state, single in-order consumer
+            return out
+        }
+    }
+
+    /// Opt-in cross-engine pipelining (mimi overlaps flowlm/flow).
+    ///
+    /// MEASURED on-device (M5 Pro, macOS 26.5, release, 3-sentence utterance,
+    /// seed 42, 3 runs each): NO win over the serial loop on either placement
+    /// — serial `.ane` 1.108 s vs pipelined 1.124 s; serial `.gpu` ~1.33 s vs
+    /// pipelined ~1.33 s (WER 0 everywhere). The Phase 7 projection assumed
+    /// mimi(CPU) dominates and overlaps flowlm/flow; in the real host the
+    /// stages don't overlap as scheduled (producer-bound and/or predictions
+    /// not actually concurrent through `compatPrediction`). Keep `false`;
+    /// re-evaluate with per-stage timers before retrying.
+    static let useCrossEnginePipeline = false
 
     /// Create the AsyncThrowingStream and spawn the generation task.
     private static func makeStream(
@@ -655,7 +737,11 @@ public struct PocketTtsSynthesizer {
         let (stream, continuation) = AsyncThrowingStream.makeStream(of: AudioFrame.self)
 
         let task = Task {
-            await generator.generate(continuation: continuation)
+            if PocketTtsSynthesizer.useCrossEnginePipeline {
+                await generator.generatePipelined(continuation: continuation)
+            } else {
+                await generator.generate(continuation: continuation)
+            }
         }
 
         continuation.onTermination = { _ in
@@ -667,34 +753,130 @@ public struct PocketTtsSynthesizer {
 
     // MARK: - Text Processing
 
-    /// Normalize a text chunk for PocketTTS (matching Python `prepare_text_prompt`).
-    static func normalizeText(_ text: String) -> (text: String, framesAfterEos: Int) {
-        var result = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Collapse whitespace
-        result = result.replacingOccurrences(
+    /// Metadata describing how a chunk was produced from the source text.
+    ///
+    /// Used by `normalizeText` to decide whether to capitalize the first letter
+    /// and whether to append a sentence-ending period. Mid-sentence chunks
+    /// (produced by clause- or word-boundary splits inside a longer sentence)
+    /// should preserve their original casing and not gain artificial sentence
+    /// punctuation, which would otherwise create unnatural pauses and prosody
+    /// arcs (see issue #584).
+    public struct TextChunk: Sendable, Equatable {
+        /// The chunk's text, with surrounding whitespace trimmed.
+        public let text: String
+        /// True when this chunk is a continuation of a sentence — i.e., it
+        /// came from a clause- or word-boundary split, not a sentence boundary.
+        public let isMidSentence: Bool
+
+        public init(text: String, isMidSentence: Bool) {
+            self.text = text
+            self.isMidSentence = isMidSentence
+        }
+    }
+
+    /// Replace Unicode smart quotes with their ASCII equivalents.
+    ///
+    /// PocketTTS's SentencePiece vocabulary is trained on ASCII apostrophes/
+    /// quotes; smart quotes (U+2018/U+2019/U+201C/U+201D) typically fall back
+    /// to byte-level pieces, which inflates the per-sentence token count and
+    /// triggers unnecessary clause splits. Modern keyboards auto-convert
+    /// ASCII apostrophes to U+2019, so French (`d'aboutir`) and English
+    /// contractions (`don't`) commonly hit this path. See issue #584.
+    static func normalizeSmartQuotes(_ text: String) -> String {
+        text.replacingOccurrences(of: "\u{2018}", with: "'")
+            .replacingOccurrences(of: "\u{2019}", with: "'")
+            .replacingOccurrences(of: "\u{201C}", with: "\"")
+            .replacingOccurrences(of: "\u{201D}", with: "\"")
+    }
+
+    /// Language-specific pre-normalization applied before the shared
+    /// smart-quote pass.
+    ///
+    /// English is a no-op — the shared normalizer already handles every
+    /// punctuation form that affects English tokenization.
+    ///
+    /// French additionally normalizes:
+    /// - Guillemets (`«` U+00AB, `»` U+00BB) → ASCII `"`. The SentencePiece
+    ///   vocab doesn't include guillemets, so they fall back to byte pieces.
+    /// - Non-breaking space (U+00A0) → regular space. French typography uses
+    ///   NBSP before `! ? : ;` and inside thousand separators; the tokenizer
+    ///   has no NBSP piece.
+    /// - Narrow non-breaking space (U+202F) → regular space (same rationale).
+    static func normalizeForLanguage(
+        _ text: String, language: PocketTtsLanguage
+    ) -> String {
+        switch language {
+        case .english, .german, .german24L, .italian, .italian24L,
+            .portuguese, .portuguese24L, .spanish, .spanish24L:
+            return text
+        case .french24L:
+            return
+                text
+                .replacingOccurrences(of: "\u{00AB}", with: "\"")
+                .replacingOccurrences(of: "\u{00BB}", with: "\"")
+                .replacingOccurrences(of: "\u{00A0}", with: " ")
+                .replacingOccurrences(of: "\u{202F}", with: " ")
+        }
+    }
+
+    /// Collapse every run of whitespace, newlines included, to one space.
+    ///
+    /// Shared by `normalizeText` and `chunkTextWithMetadata` so the text a
+    /// chunk is sized on is the text it is synthesized from.
+    static func collapseWhitespace(_ text: String) -> String {
+        text.replacingOccurrences(
             of: "\\s+", with: " ", options: .regularExpression)
+    }
 
-        // Strip trailing clause punctuation (commas, semicolons, colons)
-        // before adding sentence-ending punctuation
-        while let last = result.last, ",;:".contains(last) {
-            result = String(result.dropLast())
+    /// Normalize a text chunk for PocketTTS (matching Python `prepare_text_prompt`).
+    ///
+    /// For chunks that are continuations of a longer sentence (mid-sentence
+    /// clause/word splits), pass `isMidSentence: true` to preserve the chunk's
+    /// original casing and avoid appending an artificial sentence-ending
+    /// period. This prevents the synthesizer from rendering mid-phrase
+    /// fragments as standalone sentences (issue #584).
+    ///
+    /// The `language` parameter selects language-specific punctuation
+    /// normalization (e.g., French guillemets and NBSP). English is the
+    /// default and applies only the shared smart-quote pass.
+    static func normalizeText(
+        _ text: String,
+        isMidSentence: Bool = false,
+        language: PocketTtsLanguage = .english
+    ) -> (text: String, framesAfterEos: Int) {
+        var result = collapseWhitespace(
+            normalizeForLanguage(
+                normalizeSmartQuotes(
+                    text.trimmingCharacters(in: .whitespacesAndNewlines)),
+                language: language))
+
+        if !isMidSentence {
+            // Strip trailing clause punctuation (commas, semicolons, colons)
+            // before adding sentence-ending punctuation
+            while let last = result.last, ",;:".contains(last) {
+                result = String(result.dropLast())
+            }
+            result = result.trimmingCharacters(in: .whitespaces)
+
+            // Capitalize first letter
+            if let first = result.first, first.isLetter {
+                result = first.uppercased() + result.dropFirst()
+            }
+
+            // Add period if no terminal punctuation
+            if let last = result.last, !".!?".contains(last) {
+                result += "."
+            }
         }
-        result = result.trimmingCharacters(in: .whitespaces)
 
-        // Capitalize first letter
-        if let first = result.first, first.isLetter {
-            result = first.uppercased() + result.dropFirst()
-        }
-
-        // Add period if no terminal punctuation
-        if let last = result.last, !".!?".contains(last) {
-            result += "."
-        }
-
-        // Pad short texts for better prosody
+        // Pad short texts for better prosody — but only for full sentences.
+        // Mid-sentence chunks (clause/word-boundary continuations) must skip
+        // the leading-space padding and the extra trailing frames; otherwise
+        // each short fragment introduces ~80ms+ of silence at the seam, which
+        // re-creates the prosody break we're trying to remove (issue #584).
         let wordCount = result.split(separator: " ").count
         let framesAfterEos: Int
-        if wordCount < PocketTtsConstants.shortTextWordThreshold {
+        if !isMidSentence, wordCount < PocketTtsConstants.shortTextWordThreshold {
             result = String(repeating: " ", count: 8) + result
             framesAfterEos = PocketTtsConstants.shortTextPadFrames
         } else {
@@ -707,74 +889,163 @@ public struct PocketTtsSynthesizer {
     /// Split text into chunks that fit within the KV cache token limit.
     ///
     /// Splits at sentence boundaries (`.!?`) and groups sentences into chunks
-    /// where each chunk tokenizes to ≤ `maxTokensPerChunk` tokens.
-    /// Oversized single sentences are further split at word boundaries.
+    /// where each chunk tokenizes to ≤ `maxTokens` tokens. Oversized single
+    /// sentences are further split at clause and word boundaries.
+    ///
+    /// Smart quotes are normalized to ASCII before chunking so that French
+    /// contractions like `d'aboutir` do not get inflated token counts (#584).
     static func chunkText(
         _ text: String,
         tokenizer: SentencePieceTokenizer,
-        maxTokens: Int = PocketTtsConstants.maxTokensPerChunk
+        maxTokens: Int = PocketTtsConstants.maxTokensPerChunk,
+        language: PocketTtsLanguage = .english
     ) -> [String] {
-        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        chunkTextWithMetadata(
+            text, tokenizer: tokenizer, maxTokens: maxTokens, language: language
+        ).map { $0.text }
+    }
 
-        // If it fits in one chunk, return as-is
-        let tokenCount = tokenizer.encode(normalized).count
-        if tokenCount <= maxTokens {
-            return [normalized]
+    /// Like `chunkText`, but tags each chunk with `isMidSentence` so callers
+    /// can preserve casing/punctuation for clause- or word-boundary splits.
+    ///
+    /// `maxTokens` is a hard ceiling. When `preferredMaxTokens` is lower,
+    /// sentences up to the hard ceiling stay whole, while separate sentence
+    /// pieces are grouped only up to the preferred target.
+    ///
+    /// The `language` parameter selects language-specific abbreviation and
+    /// punctuation tables. English is the default.
+    static func chunkTextWithMetadata(
+        _ text: String,
+        tokenizer: SentencePieceTokenizer,
+        maxTokens: Int = PocketTtsConstants.maxTokensPerChunk,
+        preferredMaxTokens: Int? = nil,
+        voiceCachePosition: Int? = nil,
+        language: PocketTtsLanguage = .english
+    ) -> [TextChunk] {
+        let preferredMaxTokens = min(preferredMaxTokens ?? maxTokens, maxTokens)
+        // Size chunks on the text the model is given. `normalizeText` collapses
+        // whitespace before synthesis; a count taken before that pass measures
+        // newlines and runs of spaces the model never sees.
+        let normalized = collapseWhitespace(
+            normalizeForLanguage(
+                normalizeSmartQuotes(
+                    text.trimmingCharacters(in: .whitespacesAndNewlines)),
+                language: language))
+
+        func fits(_ candidate: String, isMidSentence: Bool = false) -> Bool {
+            fitsTextChunk(
+                candidate,
+                tokenizer: tokenizer,
+                maxTokens: maxTokens,
+                voiceCachePosition: voiceCachePosition,
+                isMidSentence: isMidSentence,
+                language: language)
         }
 
-        // Split into sentences at .!? boundaries
-        let sentences = splitSentences(normalized)
+        // If it fits in one chunk, return as-is. A single-chunk input is
+        // never mid-sentence — it's whatever the caller passed in.
+        let tokenCount = tokenizer.encode(normalized).count
+        if tokenCount <= preferredMaxTokens && fits(normalized) {
+            return [TextChunk(text: normalized, isMidSentence: false)]
+        }
 
-        // Further split any oversized sentences at word boundaries
-        var pieces: [String] = []
+        // Split into sentences at .!? boundaries, using the language's
+        // abbreviation table so e.g. French `M.` doesn't end a sentence.
+        let sentences = splitSentences(normalized, language: language)
+
+        // Further split any oversized sentences at clause/word boundaries.
+        // Track which pieces came from mid-sentence splits so the synthesizer
+        // doesn't capitalize them or append a period.
+        var pieces: [TextChunk] = []
         for sentence in sentences {
-            let sentenceTokens = tokenizer.encode(sentence).count
-            if sentenceTokens <= maxTokens {
-                pieces.append(sentence)
+            if fits(sentence) {
+                pieces.append(TextChunk(text: sentence, isMidSentence: false))
             } else {
-                pieces.append(contentsOf: splitOversizedSentence(sentence, tokenizer: tokenizer, maxTokens: maxTokens))
+                let subPieces = splitOversizedSentence(
+                    sentence,
+                    tokenizer: tokenizer,
+                    maxTokens: maxTokens,
+                    voiceCachePosition: voiceCachePosition,
+                    language: language)
+                // The first sub-piece keeps the sentence's leading capital and
+                // is treated as a sentence-start; subsequent sub-pieces are
+                // mid-sentence continuations. The last sub-piece carries the
+                // sentence's terminal punctuation (if any) and is also a
+                // continuation — its prosody should flow from the prior piece.
+                for (index, piece) in subPieces.enumerated() {
+                    pieces.append(
+                        TextChunk(
+                            text: piece,
+                            isMidSentence: index > 0
+                        ))
+                }
             }
         }
 
-        // Group pieces into chunks that fit the token limit
-        var chunks: [String] = []
-        var currentChunk = ""
+        // Group separate pieces only up to the preferred target. A sentence
+        // already above that target remains intact as long as it fits the hard
+        // ceiling. Two pieces can merge only if their mid-sentence flags are
+        // compatible; otherwise we'd lose the boundary information needed for
+        // correct prosody.
+        var chunks: [TextChunk] = []
+        var current: TextChunk?
 
         for piece in pieces {
-            let candidate: String
-            if currentChunk.isEmpty {
-                candidate = piece
-            } else {
-                candidate = currentChunk + " " + piece
+            guard let existing = current else {
+                current = piece
+                continue
             }
 
+            // Don't merge a sentence-start piece onto a mid-sentence chunk —
+            // we'd lose the sentence boundary cue.
+            if existing.isMidSentence != piece.isMidSentence {
+                chunks.append(existing)
+                current = piece
+                continue
+            }
+
+            let candidate = existing.text + " " + piece.text
             let candidateTokens = tokenizer.encode(candidate).count
-            if candidateTokens <= maxTokens {
-                currentChunk = candidate
+            if candidateTokens <= preferredMaxTokens
+                && fits(candidate, isMidSentence: existing.isMidSentence)
+            {
+                current = TextChunk(
+                    text: candidate, isMidSentence: existing.isMidSentence)
             } else {
-                if !currentChunk.isEmpty {
-                    chunks.append(currentChunk)
-                }
-                currentChunk = piece
+                chunks.append(existing)
+                current = piece
             }
         }
 
-        if !currentChunk.isEmpty {
-            chunks.append(currentChunk)
+        if let last = current {
+            chunks.append(last)
         }
 
-        return chunks.isEmpty ? [normalized] : chunks
+        return chunks.isEmpty
+            ? [TextChunk(text: normalized, isMidSentence: false)]
+            : chunks
     }
 
     /// Split an oversized sentence to fit within the token limit.
     ///
     /// First tries splitting at clause boundaries (commas, semicolons, colons).
     /// Falls back to word-boundary splitting for clauses that still exceed the limit.
-    private static func splitOversizedSentence(
+    static func splitOversizedSentence(
         _ text: String,
         tokenizer: SentencePieceTokenizer,
-        maxTokens: Int
+        maxTokens: Int,
+        voiceCachePosition: Int? = nil,
+        language: PocketTtsLanguage = .english
     ) -> [String] {
+        func fits(_ candidate: String) -> Bool {
+            fitsTextChunk(
+                candidate,
+                tokenizer: tokenizer,
+                maxTokens: maxTokens,
+                voiceCachePosition: voiceCachePosition,
+                language: language)
+        }
+
         // First try: split at clause boundaries
         let clauseParts = splitAtClauseBoundaries(text)
 
@@ -784,17 +1055,21 @@ public struct PocketTtsSynthesizer {
 
         for part in clauseParts {
             let candidate = currentPart.isEmpty ? part : currentPart + " " + part
-            let candidateTokens = tokenizer.encode(candidate).count
-
-            if candidateTokens <= maxTokens {
+            if fits(candidate) {
                 currentPart = candidate
             } else {
                 if !currentPart.isEmpty {
                     result.append(currentPart)
                 }
                 // If single clause part still exceeds limit, split at word boundaries
-                if tokenizer.encode(part).count > maxTokens {
-                    result.append(contentsOf: splitAtWordBoundaries(part, tokenizer: tokenizer, maxTokens: maxTokens))
+                if !fits(part) {
+                    result.append(
+                        contentsOf: splitAtWordBoundaries(
+                            part,
+                            tokenizer: tokenizer,
+                            maxTokens: maxTokens,
+                            voiceCachePosition: voiceCachePosition,
+                            language: language))
                     currentPart = ""
                 } else {
                     currentPart = part
@@ -812,7 +1087,7 @@ public struct PocketTtsSynthesizer {
     /// Split text at clause punctuation (commas, semicolons, colons).
     ///
     /// Does not split at commas within numbers (e.g., "3,500").
-    private static func splitAtClauseBoundaries(_ text: String) -> [String] {
+    static func splitAtClauseBoundaries(_ text: String) -> [String] {
         let clauseBreaks: Set<Character> = [",", ";", ":"]
         var parts: [String] = []
         var current = ""
@@ -848,22 +1123,35 @@ public struct PocketTtsSynthesizer {
     }
 
     /// Split text at word boundaries to fit within the token limit.
-    private static func splitAtWordBoundaries(
+    ///
+    /// Avoids orphaning a single trailing word ("…stations-service de" +
+    /// "TotalEnergies") by pre-budgeting one word back from the head chunk
+    /// when the tail would otherwise be a single short word. See issue #584.
+    static func splitAtWordBoundaries(
         _ text: String,
         tokenizer: SentencePieceTokenizer,
-        maxTokens: Int
+        maxTokens: Int,
+        voiceCachePosition: Int? = nil,
+        language: PocketTtsLanguage = .english
     ) -> [String] {
         let words = text.split(separator: " ").map(String.init)
         guard words.count > 1 else { return [text] }
+
+        func fits(_ candidate: String) -> Bool {
+            fitsTextChunk(
+                candidate,
+                tokenizer: tokenizer,
+                maxTokens: maxTokens,
+                voiceCachePosition: voiceCachePosition,
+                language: language)
+        }
 
         var chunks: [String] = []
         var currentWords: [String] = []
 
         for word in words {
             let candidate = (currentWords + [word]).joined(separator: " ")
-            let tokens = tokenizer.encode(candidate).count
-
-            if tokens > maxTokens && !currentWords.isEmpty {
+            if !fits(candidate) && !currentWords.isEmpty {
                 chunks.append(currentWords.joined(separator: " "))
                 currentWords = [word]
             } else {
@@ -875,21 +1163,79 @@ public struct PocketTtsSynthesizer {
             chunks.append(currentWords.joined(separator: " "))
         }
 
+        // If the tail is a single short word (likely orphaned by the greedy
+        // split), shift one word back from the preceding chunk so the tail
+        // has at least two words and prosody is less jarring. Only applies
+        // when the preceding chunk has multiple words to give up.
+        if chunks.count >= 2, let tail = chunks.last,
+            tail.split(separator: " ").count == 1
+        {
+            let prevIndex = chunks.count - 2
+            let prevWords = chunks[prevIndex].split(separator: " ").map(String.init)
+            if prevWords.count >= 2 {
+                let donated = prevWords.last!
+                let newPrev = prevWords.dropLast().joined(separator: " ")
+                let newTail = donated + " " + tail
+                if fits(newPrev) && fits(newTail) {
+                    chunks[prevIndex] = newPrev
+                    chunks[chunks.count - 1] = newTail
+                }
+            }
+        }
+
         return chunks
     }
 
-    /// Common abbreviations that end with a period but don't end a sentence.
-    private static let abbreviations: Set<String> = [
+    /// Common English abbreviations that end with a period but don't end a
+    /// sentence. Used as the default abbreviation set; other languages
+    /// override via `abbreviations(for:)`.
+    static let abbreviations: Set<String> = [
         "dr", "mr", "mrs", "ms", "prof", "sr", "jr", "st", "vs", "etc",
         "inc", "ltd", "co", "corp", "dept", "univ", "govt", "approx",
         "avg", "est", "gen", "gov", "hon", "sgt", "cpl", "pvt", "capt",
         "lt", "col", "maj", "cmdr", "adm", "rev", "sen", "rep",
     ]
 
+    /// French abbreviations that end with a period but don't end a sentence.
+    ///
+    /// Includes the common civility titles (`M.`, `Mme`, `Mlle`, `Mtre`),
+    /// honorifics (`Dr.`, `Pr.`), saints (`St.`, `Ste.`), reference markers
+    /// (`p.`, `pp.`, `vol.`, `chap.`, `cf.`, `cf`, `ibid.`, `op.`, `cit.`,
+    /// `etc.`), and address terms (`av.`, `bd.`, `bld.`, `rte.`).
+    static let frenchAbbreviations: Set<String> = [
+        "m", "mm", "mme", "mmes", "mlle", "mlles", "mtre", "mtres",
+        "dr", "drs", "pr", "prs", "me", "mes",
+        "st", "ste", "sts", "stes",
+        "etc", "cf", "ibid", "op", "cit", "ndlr", "nb",
+        "p", "pp", "vol", "chap", "tome", "fig",
+        "av", "bd", "bld", "rte", "no", "nos",
+    ]
+
+    /// Return the abbreviation set for a given language. English is the
+    /// default; French gets its own table. Other languages currently share
+    /// the English table until their corpora warrant a custom list.
+    static func abbreviations(for language: PocketTtsLanguage) -> Set<String> {
+        switch language {
+        case .french24L:
+            return frenchAbbreviations
+        case .english, .german, .german24L, .italian, .italian24L,
+            .portuguese, .portuguese24L, .spanish, .spanish24L:
+            return abbreviations
+        }
+    }
+
     /// Split text into sentences at `.!?` boundaries.
     ///
     /// Handles abbreviations (e.g., "Dr.", "Prof.") by not splitting after them.
-    private static func splitSentences(_ text: String) -> [String] {
+    ///
+    /// The `language` parameter selects the abbreviation table; English is the
+    /// default. French (`.french24L`) uses `frenchAbbreviations` for civility
+    /// titles, address terms, and reference markers.
+    static func splitSentences(
+        _ text: String,
+        language: PocketTtsLanguage = .english
+    ) -> [String] {
+        let abbrevSet = abbreviations(for: language)
         var sentences: [String] = []
         var current = ""
         let chars = Array(text)
@@ -907,7 +1253,7 @@ public struct PocketTtsSynthesizer {
                 let lastWord = withoutPeriod.split(separator: " ").last.map(String.init) ?? withoutPeriod
 
                 // Skip if it's a known abbreviation
-                if abbreviations.contains(lastWord.lowercased()) {
+                if abbrevSet.contains(lastWord.lowercased()) {
                     continue
                 }
 
@@ -941,11 +1287,16 @@ public struct PocketTtsSynthesizer {
     // MARK: - Embedding
 
     /// Look up text token embeddings from the embedding table.
+    ///
+    /// Vocab size is derived from the actual loaded table because each
+    /// language pack ships its own `text_embed_table` with potentially
+    /// different row counts (`PocketTtsConstants.vocabSize` is only the
+    /// English row count).
     static func embedTokens(
         _ tokenIds: [Int], constants: PocketTtsConstantsBundle
     ) -> [[Float]] {
         let dim = PocketTtsConstants.embeddingDim
-        let vocabSize = PocketTtsConstants.vocabSize
+        let vocabSize = constants.textEmbedTable.count / dim
         return tokenIds.map { id in
             guard id >= 0, id < vocabSize else {
                 logger.warning("Token ID \(id) out of range [0, \(vocabSize)), clamping")
@@ -964,14 +1315,113 @@ public struct PocketTtsSynthesizer {
     ///
     /// At 80ms per frame, 12.5 frames ≈ 1 second of audio per word.
     /// The +2 adds margin for pauses and trailing silence.
-    private static func estimateMaxFrames(text: String) -> Int {
+    static func estimateMaxFrames(text: String) -> Int {
         let wordCount = text.split(separator: " ").count
         let genLenSec = Double(wordCount) + 2.0
         return Int(genLenSec * 12.5)
     }
 
+    /// Estimate the cache space a normally paced rendering needs.
+    ///
+    /// This is intentionally separate from `estimateMaxFrames`, whose
+    /// one-second-per-word allowance is a broad generation timeout rather
+    /// than a realistic chunk-sizing budget. Half a second per word plus two
+    /// seconds for pauses and trailing audio keeps ordinary long sentences
+    /// intact while still reserving cache space for generated frames.
+    static func estimateRequiredCacheFrames(text: String) -> Int {
+        let wordCount = text.split(whereSeparator: { $0.isWhitespace }).count
+        let estimatedSeconds = Double(wordCount) * 0.5 + 2.0
+        return max(1, Int(ceil(estimatedSeconds * 12.5)))
+    }
+
+    /// Whether a text chunk fits both the caller's token ceiling and the
+    /// fixed KV cache after normalization performed by synthesis.
+    static func fitsTextChunk(
+        _ text: String,
+        tokenizer: SentencePieceTokenizer,
+        maxTokens: Int,
+        voiceCachePosition: Int?,
+        isMidSentence: Bool = false,
+        language: PocketTtsLanguage = .english
+    ) -> Bool {
+        let normalized = normalizeText(
+            text, isMidSentence: isMidSentence, language: language
+        ).text
+        let textTokenCount = tokenizer.encode(normalized).count
+        guard textTokenCount <= maxTokens else { return false }
+        guard let voiceCachePosition else { return true }
+
+        return voiceCachePosition + textTokenCount
+            + estimateRequiredCacheFrames(text: normalized)
+            <= PocketTtsConstants.kvCacheMaxLen
+    }
+
+    /// Bound a generation loop to the positions still available after
+    /// conditioning. This prevents a late KV overflow after audio frames have
+    /// already been emitted to a streaming caller.
+    static func boundedGenerationFrameCount(text: String, cachePosition: Int) -> Int {
+        let remaining = max(0, PocketTtsConstants.kvCacheMaxLen - cachePosition)
+        return min(estimateMaxFrames(text: text), remaining)
+    }
+
+    /// Reject a generation that reached the cache boundary before it could
+    /// observe EOS and emit the configured trailing frames. Streaming callers
+    /// may already have received frames, so this must surface as an error rather
+    /// than reporting truncated audio as a successful utterance.
+    static func validateGenerationCompleted(
+        generatedFrameLimit: Int,
+        cachePosition: Int,
+        eosStep: Int?,
+        framesAfterEos: Int
+    ) throws {
+        let remaining = max(0, PocketTtsConstants.kvCacheMaxLen - cachePosition)
+        guard generatedFrameLimit == remaining else { return }
+        if let eosStep, eosStep + framesAfterEos <= generatedFrameLimit {
+            return
+        }
+        throw PocketTTSError.processingFailed(
+            "PocketTTS generation exhausted the KV cache before completing the text: "
+                + "conditioning ended at position \(cachePosition), capacity "
+                + "\(PocketTtsConstants.kvCacheMaxLen)")
+    }
+
+    /// Number of cache positions occupied by voice conditioning before text
+    /// prefill starts. Shipped voices carry the exact baked offset; cloned
+    /// voices prepend one `bos_before_voice` token to their prompt frames.
+    static func voiceCachePosition(for voiceData: PocketTtsVoiceData) -> Int {
+        if let snapshot = voiceData.cacheSnapshot {
+            return snapshot.layers.map(\.offset).max() ?? snapshot.cacheSeqLen
+        }
+        return voiceData.promptLength > 0 ? voiceData.promptLength + 1 : 0
+    }
+
+    /// Clamp the caller's hard text ceiling to leave at least one generation
+    /// position. Chunking reserves the estimated speech frames separately.
+    static func effectiveMaxTokensPerChunk(
+        requested: Int,
+        voiceCachePosition: Int
+    ) throws -> Int {
+        guard requested > 0 else {
+            throw PocketTTSError.processingFailed(
+                "PocketTTS maxTokensPerChunk must be greater than zero")
+        }
+        guard voiceCachePosition >= 0 else {
+            throw PocketTTSError.processingFailed(
+                "PocketTTS voice cache position cannot be negative")
+        }
+
+        let available = PocketTtsConstants.kvCacheMaxLen - voiceCachePosition - 1
+        guard available > 0 else {
+            throw PocketTTSError.processingFailed(
+                "PocketTTS voice conditioning uses \(voiceCachePosition) of "
+                    + "\(PocketTtsConstants.kvCacheMaxLen) cache positions, leaving too little "
+                    + "room for generation")
+        }
+        return min(requested, available)
+    }
+
     /// Create the BOS embedding as an MLMultiArray [32].
-    private static func createBosEmbedding(_ bos: [Float]) throws -> MLMultiArray {
+    static func createBosEmbedding(_ bos: [Float]) throws -> MLMultiArray {
         let dim = PocketTtsConstants.latentDim
         let array = try MLMultiArray(shape: [NSNumber(value: dim)], dataType: .float32)
         let ptr = array.dataPointer.bindMemory(to: Float.self, capacity: dim)
@@ -982,11 +1432,26 @@ public struct PocketTtsSynthesizer {
         return array
     }
 
+    /// Create the first-step `sequence` input for a generation loop.
+    ///
+    /// Rank-5 packs use the NaN-BOS protocol (the graph substitutes
+    /// `bos_emb` for NaN via `isnan`). The rank-4 `_ane` FlowLM has no such
+    /// path — the ANE mangles NaN inputs before `isnan` evaluates — so for
+    /// split-KV models the BOS latent embedding is passed directly.
+    static func createBosStartSequence(
+        bosEmbedding: [Float], splitKV: Bool
+    ) throws -> MLMultiArray {
+        if splitKV {
+            return try createSequenceFromLatent(bosEmbedding)
+        }
+        return try createNaNSequence()
+    }
+
     /// Create a NaN-filled sequence `[1, 1, 32]` to signal beginning-of-sequence.
     ///
     /// The first generation step has no previous audio latent. NaN values tell
     /// the model to use the BOS embedding instead, triggering the start of speech.
-    private static func createNaNSequence() throws -> MLMultiArray {
+    static func createNaNSequence() throws -> MLMultiArray {
         let dim = PocketTtsConstants.latentDim
         let array = try MLMultiArray(
             shape: [1, 1, NSNumber(value: dim)], dataType: .float32)
@@ -1001,7 +1466,7 @@ public struct PocketTtsSynthesizer {
     ///
     /// Autoregressive feedback: each generated audio latent becomes the input
     /// for the next flowlm_step, so the model conditions on its own output.
-    private static func createSequenceFromLatent(_ latent: [Float]) throws -> MLMultiArray {
+    static func createSequenceFromLatent(_ latent: [Float]) throws -> MLMultiArray {
         let dim = PocketTtsConstants.latentDim
         let array = try MLMultiArray(
             shape: [1, 1, NSNumber(value: dim)], dataType: .float32)

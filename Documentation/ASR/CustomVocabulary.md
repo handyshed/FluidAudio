@@ -15,7 +15,81 @@ The paper introduces a dynamic programming algorithm for CTC-based keyword spott
 - Enables "shallow fusion" rescoring without beam search
 - Provides acoustic evidence for vocabulary term matching
 
+## Quick Start: Which Approach Do I Need?
+
+| Your TDT Model | Use This Approach | Speed | Memory |
+|----------------|-------------------|-------|--------|
+| TDT-CTC-110M | Approach 1 (Standalone CTC Head) | 70x real-time | ~67 MB |
+| Parakeet TDT 0.6B v2/v3 | Approach 2 (Separate CTC Encoder) | 26x real-time | ~130 MB |
+
+Both approaches achieve identical 99.4% accuracy. Approach 1 is faster but only works with TDT-CTC-110M because that model has a built-in CTC head. Approach 2 works with any TDT model but loads a separate CTC encoder.
+
+## Model Compatibility
+
+FluidAudio supports two ASR models with different architectures:
+
+| Model | Size | Architecture | Built-in CTC? |
+|-------|------|--------------|---------------|
+| **TDT-CTC-110M** | 110M params | Hybrid: shared encoder + dual heads (TDT + CTC) | ✅ Yes (1MB projection) |
+| **Parakeet TDT 0.6B v2/v3** | 600M params | Pure TDT: encoder + TDT decoder only | ❌ No |
+
+The TDT-CTC-110M model has a single encoder with **two output heads**: a TDT decoder for transcription and a CTC projection for vocabulary boosting. The Parakeet 0.6B models only have TDT decoders.
+
 ## Architecture Overview
+
+FluidAudio supports two approaches for CTC-based custom vocabulary boosting:
+
+### Approach 1: Standalone CTC Head (Beta)
+
+```
+                  ┌─────────────────────────────────────────┐
+                  │            Audio Input                  │
+                  │           (16kHz, mono)                 │
+                  └─────────────────┬───────────────────────┘
+                                    │
+                                    ▼
+                          ┌─────────────────┐
+                          │  TDT-CTC-110M   │
+                          │  Preprocessor   │
+                          │ (fused encoder) │
+                          └────────┬────────┘
+                                   │
+                          encoder output [1, 512, T]
+                                   │
+                    ┌──────────────┴──────────────┐
+                    │                             │
+                    ▼                             ▼
+          ┌─────────────────┐           ┌─────────────────┐
+          │   TDT Decoder   │           │    CTC Head     │
+          │  + Joint Network│           │ (1MB, beta)     │
+          └────────┬────────┘           └────────┬────────┘
+                   │                             │
+                   ▼                    ctc_logits [1, T, 1025]
+          ┌─────────────────┐                    │
+          │   Raw Transcript│                    ▼
+          │  "in video corp"│           ┌─────────────────┐
+          └────────┬────────┘  Custom   │ Keyword Spotter │
+                   │         Vocabulary►│   (DP Algorithm) │
+                   │                    └────────┬────────┘
+                   └──────────────┬──────────────┘
+                                  ▼
+                        ┌─────────────────┐
+                        │   Vocabulary    │
+                        │    Rescorer     │
+                        └────────┬────────┘
+                                 │
+                                 ▼
+                        ┌─────────────────┐
+                        │ Final Transcript│
+                        │   "NVIDIA Corp" │
+                        └─────────────────┘
+```
+
+The standalone CTC head is a single linear projection (512 → 1025) that's built into the hybrid TDT-CTC-110M model. It reuses the TDT encoder output, requiring only ~1MB of additional model weight and no second encoder pass.
+
+**Model Requirement:** TDT-CTC-110M only. The 0.6B models don't have a built-in CTC head.
+
+### Approach 2: Separate CTC Encoder (Stable)
 
 ```
                   ┌─────────────────────────────────────────┐
@@ -28,7 +102,7 @@ The paper introduces a dynamic programming algorithm for CTC-based keyword spott
               ▼                                               ▼
     ┌─────────────────┐                             ┌─────────────────┐
     │   TDT Encoder   │                             │   CTC Encoder   │
-    │  (Parakeet 0.6B)│                             │ (Parakeet 110M) │
+    │  (Any TDT model)│                             │ (Parakeet 110M) │
     └────────┬────────┘                             └────────┬────────┘
              │                                               │
              ▼                                               ▼
@@ -58,23 +132,51 @@ The paper introduces a dynamic programming algorithm for CTC-based keyword spott
                             └─────────────────┘
 ```
 
-## Dual Encoder Alignment
+**Model Requirement:** Works with any TDT model (TDT-CTC-110M, Parakeet TDT 0.6B v2/v3). Loads a separate 97.5MB Parakeet CTC 110M encoder.
 
-The system uses two separate neural network encoders that process the same audio:
+### Approach Comparison
 
-### 1. TDT Encoder (Primary Transcription)
-- **Model**: Parakeet TDT 0.6B (600M parameters)
+| | Standalone CTC Head (Approach 1) | Separate CTC Encoder (Approach 2) |
+|---|---|---|
+| **Works with TDT-CTC-110M** | ✅ Yes (recommended) | ✅ Yes |
+| **Works with Parakeet 0.6B v2/v3** | ❌ No | ✅ Yes |
+| **Additional model size** | 1 MB | 97.5 MB |
+| **Second encoder pass** | No (reuses TDT encoder) | Yes (separate CTC encoder) |
+| **RTFx (earnings benchmark)** | 70.29x | 25.98x |
+| **Dict Recall** | 99.4% | 99.4% |
+| **Peak Memory** | ~67 MB | ~130 MB |
+| **Status** | Beta | Stable |
+
+### Which Approach Should I Use?
+
+**If using TDT-CTC-110M:**
+- Use Approach 1 (standalone head) for maximum speed and minimal memory overhead
+- The CTC head is already built into the model - it's essentially "free"
+
+**If using Parakeet TDT 0.6B v2/v3:**
+- Must use Approach 2 (separate encoder) - the 0.6B models don't have a built-in CTC head
+- Requires loading an additional 97.5MB CTC encoder, but 25.98x RTFx is still fast enough for real-time
+
+**Why the limitation?**
+The standalone CTC head only works with TDT-CTC-110M because that model has a hybrid architecture where the TDT and CTC heads share the same encoder. The 0.6B models use pure TDT architecture with no CTC capability.
+
+## Encoder Alignment
+
+### Separate CTC Encoder (Approach 2)
+
+When using Approach 2, the system uses two independent neural network encoders that process the same audio in parallel:
+
+#### TDT Encoder (Primary Transcription)
+- **Model**: Any TDT model (TDT-CTC-110M or Parakeet TDT 0.6B v2/v3)
 - **Architecture**: Token Duration Transducer with FastConformer
 - **Output**: High-quality transcription with word timestamps
 - **Frame Rate**: ~40ms per frame
 
-### 2. CTC Encoder (Keyword Spotting)
-- **Model**: Parakeet CTC 110M (110M parameters)
+#### CTC Encoder (Keyword Spotting)
+- **Model**: Parakeet CTC 110M (110M parameters, loaded separately)
 - **Architecture**: FastConformer with CTC head
 - **Output**: Per-frame log-probabilities over 1024 tokens
 - **Frame Rate**: ~40ms per frame (aligned with TDT)
-
-### Frame Alignment
 
 Both encoders use the same audio preprocessing (mel spectrogram with identical parameters), producing frames at the same rate. This enables direct timestamp comparison between:
 - TDT decoder word timestamps
@@ -88,21 +190,24 @@ CTC Frames: [0] [1] [2] ... [374] (375 frames @ 40ms)
             Aligned timestamps
 ```
 
-### Memory Usage
+#### Memory Usage
 
-Running two encoders in parallel increases peak memory consumption:
+The memory footprint depends on which approach you use:
 
-| Configuration | Peak RAM | Notes |
-|---------------|----------|-------|
-| TDT encoder only | ~66 MB | Standard transcription |
-| TDT + CTC encoders | ~130 MB | With vocabulary boosting |
+| Configuration | Peak RAM | Approach |
+|---------------|----------|----------|
+| TDT encoder only | ~66 MB | No vocabulary boosting |
+| TDT + CTC head | ~67 MB | Approach 1 (TDT-CTC-110M only) |
+| TDT + CTC encoders | ~130 MB | Approach 2 (any TDT model) |
 
 *Measured on iPhone 17 Pro. Memory settles after initial model loading.*
 
-The additional ~64 MB overhead comes from the CTC encoder (Parakeet 110M) being loaded alongside the primary TDT encoder. For memory-constrained scenarios, consider:
-- Loading the CTC encoder on-demand rather than at startup
-- Unloading the CTC encoder after transcription completes
-- Using vocabulary boosting only for files where domain terms are expected
+**Memory optimization strategies:**
+- **Approach 1 (TDT-CTC-110M)**: Adds negligible memory (~1MB) since it reuses the existing encoder output
+- **Approach 2 (any TDT model)**: Adds ~64MB for the separate CTC encoder. For memory-constrained scenarios:
+  - Load the CTC encoder on-demand rather than at startup
+  - Unload the CTC encoder after transcription completes
+  - Use vocabulary boosting only for files where domain terms are expected
 
 ## Pipeline Components
 
@@ -185,6 +290,88 @@ Performs principled comparison between original transcript words and vocabulary 
 - `VocabularyRescorer+TokenEvaluation.swift` — per-candidate scoring and guard logic
 - `VocabularyRescorer+Utilities.swift` — string similarity, normalization, token boundary helpers
 
+#### Non-Mutating Candidate Evidence
+
+`ctcTokenRescore()` remains the compatibility API for callers that want FluidAudio to apply its
+existing replacement decision. Call `ctcTokenEvaluateCandidates()` instead when the application
+needs to preserve the decoder transcript and make the final replacement decision itself:
+
+```swift
+let output = rescorer.ctcTokenEvaluateCandidates(
+    transcript: baseTranscript,
+    tokenTimings: tokenTimings,
+    logProbs: ctcLogProbs,
+    frameDuration: 0.04
+)
+
+// Always identical to the supplied decoder transcript.
+let untouchedText = output.baseText
+print(output.baseWords) // Exact source-word sequence indexed by every wordRange.
+
+for candidate in output.candidates {
+    print(candidate.candidateID, candidate.origin)
+    print(candidate.basePhrase, candidate.canonicalTerm, candidate.matchedAlias as Any)
+    print(candidate.rawOriginalCTCScore, candidate.rawVocabularyCTCScore)
+    print(candidate.effectiveBoost as Any, candidate.comparisonPassed)
+    print(candidate.legacyOutcome, candidate.wordRange, candidate.tokenRange as Any)
+    print(candidate.baseTextUTF8Range as Any)
+}
+```
+
+The candidate API runs the same discovery, guards, and CTC comparison as legacy rescoring, but it
+returns every comparison evaluation without rewriting `baseText`. Each candidate identifies the
+canonical term, the configured alias that produced the best string-similarity score (or `nil` when
+the canonical form produced it), string similarity, raw CTC scores before context biasing, and the
+effective boost. `matchedAlias` identifies the winning configured form even when the match was
+fuzzy; its presence does not prove that the alias was spoken exactly. Consumers that need to
+distinguish exact from fuzzy scorer results can use `similarity == 1.0`. That score reflects the
+discovery path's normalized scorer input: compound matching may concatenate adjacent words, and
+normalization may ignore case or punctuation. It therefore does not assert raw-text equality or
+determine whether applying the vocabulary replacement is semantically safe. Clients implementing
+custom arbitration must make that policy decision themselves.
+
+`comparisonPassed` reports only the numeric, pre-arbitration comparison: boosted vocabulary score
+greater than original score. `legacyOutcome` reports what the compatibility `ctcTokenRescore()`
+path finally did after overlap arbitration:
+
+- `applied` — comparison passed and the candidate was written to the legacy transcript.
+- `rejectedByComparison` — the legacy floating-point comparison ran and rejected the candidate.
+- `unavailableEvidence` — the comparison could not run, for example because tokenizer evidence was
+  unavailable.
+- `supersededByOverlap` — comparison passed, but an overlapping candidate won final arbitration.
+
+`comparisonPassed` and `legacyOutcome` preserve the comparison FluidAudio actually performed. A
+raw score remains `nil` when the underlying scorer produced a non-finite diagnostic value, but that
+does not retroactively turn a completed legacy comparison into `unavailableEvidence`. In that case
+the structured outcome remains authoritative and the display reason omits non-finite score text.
+
+`candidateID` is a non-negative correlation identifier unique only within one
+`CandidateEvidenceOutput`. It connects an evaluated row to its final overlap outcome; callers must
+not compare its numeric value across outputs or repeated evaluations. Duplicate-looking rows are
+intentional: separate word-centric, term-centric-single-word, term-centric-multiword, and
+spotter-rescue evaluations retain distinct IDs and `origin` values so diagnostics can attribute
+their discovery paths.
+
+`wordRange` is a half-open range into the returned `output.baseWords` array exactly as FluidAudio
+built it from token timings. It does not index a whitespace split or another caller-derived view of
+`baseText`. `tokenRange` is a half-open range into the supplied `tokenTimings`; it is `nil` when the
+source tokens are not contiguous.
+
+`baseTextUTF8Range` is a half-open UTF-8 byte range into untouched `baseText`. FluidAudio emits it
+only when the complete `baseWords` sequence has one byte-exact ordered alignment, the candidate span
+lands on valid String boundaries, and the aligned substring normalizes to `basePhrase`. Recognized
+quotation wrappers and recognized terminal punctuation remain outside the range; technical boundary
+operators, currency signs, and punctuation such as `+`, `#`, `@`, `$`, and a leading `.` remain
+inside it. Unrelated symbols such as emoji and trademarks, plus ambiguous edge syntax, produce `nil`
+instead of a guessed span, while punctuation and separators inside a multiword span are preserved.
+A `nil` range is explicit missing provenance: callers must not guess a replacement span or mutate
+text through a fabricated range.
+
+Scores and timestamps are likewise optional rather than sentinel values when evidence is
+unavailable. Downstream applications should apply their own candidate policy using the structured
+evidence. They must not replay every `comparisonPassed` row, infer missing scores/ranges, or treat
+candidate array order as a stable identity.
+
 ### 5. CustomVocabularyContext (`CustomVocabularyContext.swift`)
 
 Defines vocabulary terms to boost:
@@ -197,7 +384,9 @@ let vocabulary = CustomVocabularyContext(terms: [
 ])
 ```
 
-Each term is tokenized and scored against CTC log-probabilities. High-scoring terms are used to correct the TDT transcript.
+Terms without `ctcTokenIds` are tokenized with the CTC tokenizer when boosting is configured (`configureVocabularyBoosting` on any engine, or `VocabularyBoostingSession.init`), so the plain `CustomVocabularyTerm(text:)` form above works as written. Pre-tokenized terms (from `loadWithCtcTokens(from:)`, or an explicit `ctcTokenIds:`) are used as-is; a term that encodes to nothing is dropped with a warning. Each term is then scored against CTC log-probabilities, and high-scoring terms correct the transcript. (Before #851 this path was a silent no-op: untokenized terms were skipped without any log.)
+
+**Streaming (`SlidingWindowAsrManager`).** Every window is rescored, including windows that are still volatile (a clip shorter than `minContextForConfirmation`, a low-confidence window, the final flush) — confirmation only governs display promotion, and a window's text is promoted verbatim later.
 
 #### Alias Support
 
@@ -260,6 +449,177 @@ Frame 3:  log_prob[3][t₃] = -2.1
 | `stopwordSpanSimilarity` | 0.85 | Similarity required when stopwords are present in span |
 
 All constants are defined in `ContextBiasingConstants.swift`.
+
+### Vocabulary-Size-Aware Tuning
+
+`minSimilarity` is the primary lever for the precision/recall trade-off,
+and the optimal value depends on **distractor density** — how many
+vocabulary terms are confusable with each other. The rescorer picks the
+threshold automatically based on vocabulary size:
+
+| Vocab size | `minSimilarity` | Rationale |
+|------------|-----------------|-----------|
+| ≤ 10 terms | 0.50 | Small vocabularies have low collision risk; permissive gate maximizes recall |
+| 11–100 terms | 0.55 | Medium vocabularies need a tighter gate to filter weak matches |
+| > 100 terms | 0.60 | Large vocabularies (e.g. drug lists with biotech distractors) require strict gating to suppress false-positive replacements between similar terms |
+
+Tuning was performed on three benchmarks after the blank-aware DP fix:
+
+- **Small (earnings22 KWS, ≤9 terms/file):** `cbw` sweep showed F-score
+  plateaus at `cbw ≈ 4.5`. Below 3.5 each step costs 1–5 TPs; above 4.5
+  the curve is flat.
+- **Large (FDA-approved-drugs KWS, 37–55 terms/file):** `minSimilarity`
+  peaks at 0.50–0.55 (TP=218, FP=0, F=96.0). The earlier 0.60 default
+  left 5 TPs on the table.
+- **Extra-large (FDA-extended, ~670 terms/file with 600+ Purple Book
+  biologic distractors that never appear in the audio):**
+  `minSimilarity=0.55` produced 33 FPs (precision 86.2%); raising to
+  0.60 cut FPs to 8 (precision 96.3%) at the cost of just 1 TP.
+
+`cbw` had no measurable effect on either large-vocab benchmark
+(precision was already ceiling-bound), so all three buckets converge
+on `cbw=4.5`.
+
+The thresholds, the size buckets (`largeVocabThreshold = 10`,
+`extraLargeVocabThreshold = 100`), and the dispatch logic live in
+`ContextBiasingConstants.rescorerConfig(forVocabSize:)`.
+
+### Short-Term Over-Fire Controls (opt-in, #702)
+
+The blank-aware DP score is a per-token average log-prob. A **short** keyword
+(few tokens) can free-start align to its single best-matching frame-run and
+score close to zero per token, so it can beat a correctly transcribed common
+word. With vocabularies of short terms that collide acoustically with ordinary
+English (`CRAN`~"ran", `Snyk`~"sync", a 3-letter acronym ~ a function word),
+the rescorer over-fires — replacing ordinary words that are none of the
+keywords.
+
+Benchmarking shows the over-fire and the genuine KWS recall on
+distinctive-name vocabularies (earnings22) come from the *same* mechanisms
+(the flat `cbw` boost and the acoustic spotter-rescue), and neither string
+similarity nor token length separates them — gating hard enough to suppress
+the false positives also costs recall. These controls are therefore **opt-in
+and default to disabled (no behavior change)**:
+
+| `VocabularyRescorer.Config` field | CLI flag | Env | Default | Recommended (short-vocab) |
+|---|---|---|---|---|
+| `shortTermCbwTaperPivot` | `--vocab-short-term-taper-pivot` | `FLUID_CBW_TAPER_PIVOT` | `1` (off) | `5` |
+| `shortTermCbwTaperExponent` | — | `FLUID_CBW_TAPER_EXP` | `2.0` | `2.0` |
+| `spotterRescueMinSimilarity` | `--vocab-spotter-min-sim` | `FLUID_SPOTTER_MIN_SIM` | `0.0` (off) | `0.30` |
+| `spotterRescueMultiWordMinSimilarity` | `--vocab-spotter-min-sim-multi` | `FLUID_SPOTTER_MIN_SIM_MULTI` | `0.0` (off) | `0.50` |
+
+The taper scales the `cbw` boost down for terms with fewer than `pivot` tokens
+(`cbw * (tokenCount / pivot) ** exponent`). The spotter floors require a
+minimum string similarity before the acoustic-only rescue path may fire
+(higher for multi-word spans, which are the most error-prone). Tune these for
+short-keyword KWS; leave them off for distinctive-name vocabularies.
+
+#### When to enable
+
+Turn these on when **all** of the following hold; otherwise leave them off:
+
+- the vocabulary is small and made of **short** terms (≤ ~5 chars / a few
+  CTC tokens), and
+- those terms **collide acoustically with ordinary English** (brand names,
+  acronyms, function-word homophones), and
+- you observe ordinary words being replaced by keywords that were not spoken.
+
+For vocabularies of long, distinctive names (company/drug names, the
+earnings22 profile) leave them **off** — enabling them costs KWS recall
+(see below).
+
+#### Enabling
+
+```bash
+# CLI (batch) — recommended short-vocab settings
+fluidaudio transcribe audio.wav \
+    --custom-vocab short_terms.txt \
+    --vocab-short-term-taper-pivot 5 \
+    --vocab-spotter-min-sim 0.30 \
+    --vocab-spotter-min-sim-multi 0.50
+```
+
+```swift
+// API — pass an opt-in Config to the rescorer
+let config = VocabularyRescorer.Config(
+    shortTermCbwTaperPivot: 5,            // taper boost for terms < 5 tokens
+    spotterRescueMinSimilarity: 0.30,     // single-word acoustic-rescue floor
+    spotterRescueMultiWordMinSimilarity: 0.50  // multi-word floor
+)
+let rescorer = try await VocabularyRescorer.create(
+    spotter: ctcSpotter,
+    vocabulary: vocabulary,
+    config: config
+)
+```
+
+```bash
+# Env overrides (handy for parameter sweeps; apply to any entry point)
+export FLUID_CBW_TAPER_PIVOT=5
+export FLUID_SPOTTER_MIN_SIM=0.30
+export FLUID_SPOTTER_MIN_SIM_MULTI=0.50
+```
+
+#### Measured effect
+
+Repro: 8 short brand/acronym distractors (none spoken) over one minute of
+ordinary speech, plus the earnings22-kws KWS set (200 files) as the recall
+guard.
+
+| Setting | distractor false positives | earnings22 recall |
+|---|---|---|
+| **off (default)** | 12 | 95.7% |
+| recommended opt-in (pivot 5, floors 0.30 / 0.50) | **0** | (lower — only enable for short-vocab KWS) |
+
+The defaults are byte-for-byte identical to the pre-#702 behavior; the floors
+and taper only change scoring when explicitly enabled.
+
+### Disabling the Acoustic Spotter-Rescue (opt-in, #724)
+
+The biggest single lever for short-keyword over-firing is the **spotter-anchored
+acoustic rescue** — a pass that proposes a vocabulary term when the CTC keyword
+spotter detects it acoustically, even if string similarity to the transcript is
+low (it exists to recover brand names TDT mangles past the similarity gate, e.g.
+`DiaSorin` → `the solar`). On short terms that collide with common English it is
+the dominant false-positive source. It was added on top of the pre-0.14.5
+pipeline; turning it off reproduces the older, much-lower over-fire behavior.
+
+| `VocabularyRescorer.Config` field | CLI flag | Env | Default |
+|---|---|---|---|
+| `spotterRescueEnabled` | `--vocab-disable-spotter-rescue` | `FLUID_SPOTTER_RESCUE` (`0` disables) | `true` (on) |
+
+```swift
+// Disable the acoustic rescue for short-keyword KWS:
+let config = VocabularyRescorer.Config(spotterRescueEnabled: false)
+```
+
+```bash
+fluidaudio transcribe audio.wav --custom-vocab short_terms.txt \
+    --vocab-disable-spotter-rescue
+```
+
+**When to disable:** small vocabularies of short terms that collide with ordinary
+English (brand names, acronyms). **When to keep on (default):** distinctive-name
+vocabularies (company/drug names) where the acoustic rescue recovers
+heavily-mangled terms that string matching misses.
+
+#### Measured effect
+
+Repro: 8 short brand/acronym distractors (none spoken) across a 90-clip,
+3-voice ordinary-speech set, plus a 100-pair distinctive-name biasing set as the
+recall guard.
+
+| Setting | distractor false positives | biasing recall |
+|---|---|---|
+| **on (default)** | ~94 | 0.92 |
+| `spotterRescueEnabled = false` | **~19** | **0.97** |
+
+For short colliding vocabularies, disabling the rescue both **lowers over-fire**
+and (because spurious replacements no longer clobber correct words) **raises**
+recall — it reproduces the pre-rescue scoring. This is a bigger, cleaner lever
+than the per-term floors above for the short-vocab case; the floors remain useful
+when you want to *keep* the rescue but gate its lowest-similarity firings. The
+default is unchanged, so existing distinctive-name setups are unaffected.
 
 ## Usage Example
 

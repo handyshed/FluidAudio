@@ -49,14 +49,14 @@ final class CoreMLDiarizerTests: XCTestCase {
         XCTAssertFalse(manager.isAvailable, "Manager should not be available before initialization")
     }
 
-    func testNotInitializedErrors() {
+    func testNotInitializedErrors() async {
         let testSamples = Array(repeating: Float(0.5), count: 16000)
         let config = DiarizerConfig()
         let manager = DiarizerManager(config: config)
 
         // Test diarization fails when not initialized
         do {
-            _ = try manager.performCompleteDiarization(testSamples, sampleRate: 16000)
+            _ = try await manager.performCompleteDiarization(testSamples, sampleRate: 16000)
             XCTFail("Should have thrown notInitialized error")
         } catch DiarizerError.notInitialized {
             // Expected error
@@ -348,6 +348,30 @@ extension CoreMLDiarizerTests {
 
         XCTAssertEqual(models.embeddingModel.configuration.computeUnits, customConfig.computeUnits)
     }
+
+    /// Tests that the OFFLINE diarizer model loader honors a user-specified
+    /// configuration's compute units. This is parity with
+    /// `testModelLoadingCustomConfig` above (the streaming `DiarizerModels`
+    /// loader already honored it); `OfflineDiarizerModels.load(configuration:)`
+    /// previously accepted the parameter but ignored it and always loaded `.all`.
+    func testOfflineModelLoadingCustomConfig() async throws {
+
+        XCTExpectFailure("Download might fail in CI environment", strict: false)
+
+        let customConfig = MLModelConfiguration()
+        customConfig.computeUnits = .cpuOnly
+
+        let models = try await OfflineDiarizerModels.load(configuration: customConfig)
+
+        // Segmentation, embedding, and PLDA-rho models load with the requested
+        // compute units; the fbank front-end intentionally stays on `.cpuOnly`.
+        XCTAssertEqual(
+            models.segmentationModel.configuration.computeUnits, customConfig.computeUnits)
+        XCTAssertEqual(
+            models.embeddingModel.configuration.computeUnits, customConfig.computeUnits)
+        XCTAssertEqual(
+            models.pldaRhoModel.configuration.computeUnits, customConfig.computeUnits)
+    }
 }
 
 // MARK: - CoreML Backend Specific Test
@@ -400,7 +424,7 @@ final class CoreMLBackendIntegrationTests: XCTestCase {
             // Test that we can perform basic operations
             let testSamples = Array(repeating: Float(0.5), count: 16000)
 
-            let _ = try diarizer.performCompleteDiarization(testSamples, sampleRate: 16000)
+            let _ = try await diarizer.performCompleteDiarization(testSamples, sampleRate: 16000)
 
             diarizer.cleanup()
         } catch {

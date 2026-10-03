@@ -5,6 +5,12 @@ import XCTest
 
 final class TextNormalizerTests: XCTestCase {
 
+    override func setUpWithError() throws {
+        try XCTSkipUnless(
+            NemoTextNormalizer.isAvailable,
+            "NemoTextProcessing trait disabled; engine not linked")
+    }
+
     // MARK: - NLTagger Context Spotting
 
     /// Ambiguous words that are both punctuation spoken forms AND common English words.
@@ -114,47 +120,41 @@ final class TextNormalizerTests: XCTestCase {
 
     // MARK: - TextNormalizer Instance
 
-    func testTextNormalizerInit() {
+    func testNativeLibraryAlwaysAvailable() {
+        // The engine is linked via the bundled NemoTextProcessing binary target,
+        // so it must be available in every consumer build (issue #839).
         let normalizer = TextNormalizer()
-        // isNativeAvailable depends on whether the Rust library is linked.
-        // In unit tests it won't be, so just verify it initializes without crashing.
-        XCTAssertNotNil(normalizer)
+        XCTAssertTrue(normalizer.isNativeAvailable)
+        XCTAssertTrue(normalizer.isTnAvailable)
+        XCTAssertNotNil(normalizer.version)
     }
 
-    func testTextNormalizerFallbackWithoutNativeLib() {
+    func testNormalizeConvertsSpokenNumbers() {
         let normalizer = TextNormalizer()
-
-        guard !normalizer.isNativeAvailable else {
-            // If native lib IS available (e.g., in integration tests), skip this test
-            return
-        }
-
-        // Without native library, normalize should return input unchanged
-        XCTAssertEqual(normalizer.normalize("twenty one"), "twenty one")
-        XCTAssertEqual(normalizer.normalizeSentence("I have twenty one apples"), "I have twenty one apples")
+        XCTAssertEqual(normalizer.normalize("twenty one"), "21")
+        XCTAssertEqual(normalizer.normalize("two hundred"), "200")
+        // Exact repro from issue #839
+        XCTAssertEqual(normalizer.normalize("twelve dollars"), "$12")
     }
 
-    func testTextNormalizerVersionWithoutNativeLib() {
+    func testNormalizeSentenceConvertsSpans() {
         let normalizer = TextNormalizer()
-
-        guard !normalizer.isNativeAvailable else {
-            return
-        }
-
-        XCTAssertNil(normalizer.version)
+        XCTAssertEqual(normalizer.normalizeSentence("I have twenty one apples"), "I have 21 apples")
+        XCTAssertEqual(normalizer.normalizeSentence("it costs twelve dollars"), "it costs $12")
     }
 
-    func testTextNormalizerCustomRulesWithoutNativeLib() {
+    func testTnNormalizeConvertsWrittenToSpoken() {
         let normalizer = TextNormalizer()
+        XCTAssertEqual(normalizer.tnNormalize("$5.50"), "five dollars fifty cents")
+    }
 
-        guard !normalizer.isNativeAvailable else {
-            return
-        }
-
-        // Custom rules should be no-ops without native lib
-        normalizer.addRule(spoken: "test", written: "TEST")
+    func testCustomRules() {
+        let normalizer = TextNormalizer()
+        normalizer.addRule(spoken: "gee pee tee", written: "GPT")
+        XCTAssertEqual(normalizer.ruleCount, 1)
+        XCTAssertEqual(normalizer.normalize("gee pee tee"), "GPT")
+        XCTAssertTrue(normalizer.removeRule(spoken: "gee pee tee"))
         XCTAssertEqual(normalizer.ruleCount, 0)
-        XCTAssertFalse(normalizer.removeRule(spoken: "test"))
     }
 
     func testTextNormalizerIsSendable() {
@@ -322,45 +322,33 @@ final class TextNormalizerTests: XCTestCase {
 
     // MARK: - filterAmbiguousWords Logic
 
-    func testFilterReturnsUnchangedWhenNoAmbiguousWords() {
-        let normalizer = TextNormalizer()
-        // This sentence has no ambiguous words — should pass through unchanged
-        let input = "I have twenty one apples"
-        // Without native lib, normalizeSentence returns input unchanged,
-        // but we can verify the function doesn't crash on non-ambiguous input
-        let result = normalizer.normalizeSentence(input)
-        XCTAssertEqual(result, input)
-    }
-
     func testFilterWithAmbiguousWordInSentence() {
         let normalizer = TextNormalizer()
-        // "period" as a noun — should be preserved even through normalization pipeline
-        let input = "the period of growth was remarkable"
-        let result = normalizer.normalizeSentence(input)
-        // Without native lib, returns unchanged. With native lib, "period" should
-        // still be preserved because NLTagger identifies it as a noun.
-        XCTAssertEqual(result, input)
+        // Ambiguous words used as natural language (nouns) must survive
+        // normalization: the native ITN would otherwise rewrite "period" → ".",
+        // "dash" → "-". Passes with the native lib (masked + restored) and
+        // without it (fallback returns the input unchanged).
+        let unchanged = [
+            "the period of growth was remarkable",
+            "add a period here",
+            "the dash between them",
+        ]
+        for input in unchanged {
+            XCTAssertEqual(normalizer.normalizeSentence(input), input)
+        }
     }
 
-    func testFilterWithStandalonePunctuationWord() {
+    func testStandaloneAmbiguousWordStillNormalizes() {
+        // The mask only protects natural-language usage; a standalone spoken
+        // command still normalizes.
         let normalizer = TextNormalizer()
-        // Standalone "period" — should be treated as punctuation command
-        let input = "period"
-        let result = normalizer.normalizeSentence(input)
-        // Without native lib, returns unchanged. With native lib,
-        // standalone "period" should normalize to "."
-        if normalizer.isNativeAvailable {
-            XCTAssertEqual(result, ".")
-        } else {
-            XCTAssertEqual(result, input)
-        }
+        XCTAssertEqual(normalizer.normalizeSentence("period"), ".")
     }
 
     // MARK: - TextNormalizer normalize(result:) Method
 
-    func testNormalizeASRResultWithoutNativeLib() {
+    func testNormalizeASRResult() {
         let normalizer = TextNormalizer()
-        guard !normalizer.isNativeAvailable else { return }
 
         let asrResult = ASRResult(
             text: "I have twenty one apples",
@@ -372,30 +360,48 @@ final class TextNormalizerTests: XCTestCase {
             ctcAppliedTerms: []
         )
         let normalized = normalizer.normalize(result: asrResult)
-        // Without native lib, text should be unchanged
-        XCTAssertEqual(normalized.text, "I have twenty one apples")
+        XCTAssertEqual(normalized.text, "I have 21 apples")
         // Metadata should be preserved
         XCTAssertEqual(normalized.confidence, 0.95)
         XCTAssertEqual(normalized.duration, 2.0)
     }
 
-    // MARK: - TextNormalizer Shared Instance
-
-    func testSharedInstanceIsSameType() {
-        let shared = TextNormalizer.shared
-        XCTAssertNotNil(shared)
-        // Verify shared instance is consistent
-        XCTAssertEqual(shared.isNativeAvailable, TextNormalizer.shared.isNativeAvailable)
-    }
-
     // MARK: - TextNormalizer maxSpanTokens Variant
 
-    func testNormalizeSentenceWithMaxSpanWithoutNativeLib() {
+    func testNormalizeSentenceWithMaxSpan() {
         let normalizer = TextNormalizer()
-        guard !normalizer.isNativeAvailable else { return }
+        XCTAssertEqual(normalizer.normalizeSentence("twenty one apples", maxSpanTokens: 8), "21 apples")
+    }
 
-        let input = "twenty one apples"
-        let result = normalizer.normalizeSentence(input, maxSpanTokens: 8)
-        XCTAssertEqual(result, input)
+    // MARK: - TN (written → spoken) surface
+
+    func testTnNormalizeSentence() {
+        let normalizer = TextNormalizer()
+        XCTAssertEqual(normalizer.tnNormalizeSentence("I paid $5"), "I paid five dollars")
+    }
+}
+
+/// Contract when the package is resolved with the `NemoTextProcessing` trait
+/// disabled (#880, #888): the API stays present, reports the engine as absent,
+/// and every entry point is a passthrough instead of a crash or a silent rewrite.
+final class TextNormalizerUnavailableTests: XCTestCase {
+
+    override func setUpWithError() throws {
+        try XCTSkipIf(NemoTextNormalizer.isAvailable, "engine linked; passthrough path not reachable")
+    }
+
+    func testReportsUnavailableAndPassesThrough() {
+        let normalizer = TextNormalizer()
+        XCTAssertFalse(normalizer.isNativeAvailable)
+        XCTAssertFalse(normalizer.isTnAvailable)
+        XCTAssertNil(normalizer.version)
+        XCTAssertEqual(normalizer.normalize("twelve dollars"), "twelve dollars")
+        XCTAssertEqual(normalizer.normalizeSentence("period"), "period")
+        XCTAssertEqual(normalizer.normalizeSentence("two hundred", maxSpanTokens: 3), "two hundred")
+        XCTAssertEqual(normalizer.tnNormalize("$12"), "$12")
+        XCTAssertEqual(normalizer.tnNormalizeSentence("$12"), "$12")
+        normalizer.addRule(spoken: "foo", written: "bar")
+        XCTAssertEqual(normalizer.ruleCount, 0)
+        XCTAssertFalse(normalizer.removeRule(spoken: "foo"))
     }
 }
