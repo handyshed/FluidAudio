@@ -49,10 +49,19 @@ internal enum NemotronRecognitionLogits {
         guard let maximum = values.max(), count > 0 else { return [] }
         let denominator = values.reduce(Float(0)) { $0 + exp($1 - maximum) }
         // Preserve the fork's top-K contract: rank the full distribution, then remove blank.
-        return values.enumerated().map {
-            TokenCandidate(tokenId: $0.offset, probability: exp($0.element - maximum) / denominator)
-        }.sorted {
-            $0.probability == $1.probability ? $0.tokenId < $1.tokenId : $0.probability > $1.probability
-        }.prefix(count).filter { $0.tokenId != blank }
+        var candidates: [TokenCandidate] = []
+        candidates.reserveCapacity(values.count)
+        for (token, logit) in values.enumerated() {
+            let probability: Float = exp(logit - maximum) / denominator
+            candidates.append(TokenCandidate(tokenId: token, probability: probability))
+        }
+        candidates.sort { left, right in
+            if left.probability == right.probability {
+                return left.tokenId < right.tokenId
+            }
+            return left.probability > right.probability
+        }
+        let topCandidates = candidates.prefix(count)
+        return topCandidates.filter { $0.tokenId != blank }
     }
 }
