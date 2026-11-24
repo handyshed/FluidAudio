@@ -79,6 +79,7 @@ extension StreamingNemotronAsrManager {
     }
 
     internal func clearRecognitionState() {
+        sessionGeneration &+= 1
         savedRecognitionLogits.removeAll(keepingCapacity: true)
         snapshotRevision = 0
         lastEncoderOutput = nil

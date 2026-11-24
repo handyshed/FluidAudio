@@ -30,6 +30,12 @@ public actor NemotronStreamingAsrManager {
     }
     public func processSamples(_ samples: [Float]) async throws -> String { try await engine.processSamples(samples) }
     public func getPartialTranscript() async -> String { await engine.getPartialTranscript() }
+    public func recognitionDisplay() async throws -> NemotronRecognitionDisplay {
+        try await engine.recognitionDisplay()
+    }
+    public func tentativeDisplay(minRemainderSamples: Int = 3200) async throws -> NemotronRecognitionDisplay? {
+        try await engine.tentativeDisplay(minRemainderSamples: minRemainderSamples)
+    }
     public func decodeToken(_ id: Int) async -> String { await engine.decodeToken(id) }
     public func rawDecodeToken(_ id: Int) async -> String { await engine.rawDecodeToken(id) }
     public func finish() async throws -> (
