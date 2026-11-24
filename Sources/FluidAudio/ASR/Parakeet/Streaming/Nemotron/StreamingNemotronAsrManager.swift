@@ -78,6 +78,9 @@ public actor StreamingNemotronAsrManager {
 
     // Stats
     internal var processedChunks: Int = 0
+    // Monotonic session counter incremented on reset/finish so in-flight tentative decodes
+    // discard stale hypotheses if a session resets across an `await`.
+    internal var sessionGeneration: UInt64 = 0
 
     public private(set) var mlConfiguration: MLModelConfiguration
 
